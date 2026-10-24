@@ -1,0 +1,12 @@
+# Stores to search - one per line:   Name - home URL
+# Lines starting with # are ignored.
+# If a shop's search page cannot be detected automatically, add its search URL
+# (with {q} where the search words go) as a third part, e.g.
+#   Power - https://www.power.se - https://www.power.se/search/?q={q}
+
+Elgiganten - https://www.elgiganten.se
+NetOnNet - https://www.netonnet.se
+Webhallen - https://www.webhallen.com/se
+Inet - https://www.inet.se
+Kjell - https://www.kjell.com/se
+# Komplett - https://www.komplett.se     (reset our connections in testing)
