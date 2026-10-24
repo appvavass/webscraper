@@ -4,6 +4,10 @@ price_monitor.py - Search Swedish web shops for a product and track its price.
 
 Usage
 -----
+    Stores are read from stores.txt (next to this script), one per line:
+        NetOnNet - https://www.netonnet.se
+    The file is created with sensible defaults on the first run.
+
     # Search several stores, pick the best matches, record prices, report drops
     python price_monitor.py --search "Sony WH-1000XM5"
 
@@ -55,9 +59,11 @@ import json
 import logging
 import random
 import re
+import shutil
 import sqlite3
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -107,68 +113,159 @@ log = logging.getLogger("price_monitor")
 
 
 # --------------------------------------------------------------------------- #
-# Store definitions
+# Store definitions (loaded from stores.txt)
 # --------------------------------------------------------------------------- #
-# Adding a store = adding one entry here. No per-store CSS selectors are needed;
-# product pages are parsed generically (see extract_product_data).
+# stores.txt lists one shop per line:      Name - home URL
+# Optional third part if the search page cannot be detected automatically:
+#                                          Name - home URL - https://shop.se/sok?q={q}
+# Blank lines and lines starting with # are ignored.
 #
-#   search_url  - search page; {q} is replaced by the URL-encoded keywords
-#   product_re  - regex matching the URL *path* of a product page
-#   id_re       - optional regex whose group(1) is the shop's own product ID
-#                 (makes the tracking ID stable even if the URL slug changes)
-#
-# NOTE: shops change their URLs now and then. If a store stops returning results,
-# open its search page in a browser and adjust search_url / product_re here.
+# For shops this script knows (KNOWN below) the tuned settings are used.
+# For any other shop it detects the search form on the home page and finds
+# product links on the result page by looking for links that sit next to a price;
+# every candidate page is then verified by reading its price/name (see
+# extract_product_data), so no per-store CSS selectors are ever needed.
 
 _LINK = r"""[^\s"'<>\\?#]+"""
 
 
 @dataclass(frozen=True)
 class Store:
-    name: str
-    domain: str
-    search_url: str
-    product_re: "re.Pattern[str]"
-    id_re: Optional["re.Pattern[str]"] = None
+    name: str                                   # label shown in output (from stores.txt)
+    domain: str                                 # e.g. "netonnet.se"
+    home: str                                   # home URL from stores.txt
+    search_url: Optional[str] = None            # template containing {q}; None = auto-detect
+    product_re: Optional["re.Pattern[str]"] = None   # None = generic detection
+    id_re: Optional["re.Pattern[str]"] = None   # group(1) = the shop's own product number
+    key: str = ""                               # stable name used when building product IDs
 
 
-STORES = [
-    Store("Elgiganten", "elgiganten.se",
-          "https://www.elgiganten.se/search?q={q}&view=products",
-          re.compile(r"/product/" + _LINK)),
-    Store("NetOnNet", "netonnet.se",
-          "https://www.netonnet.se/search?query={q}",
-          re.compile(r"/art/" + _LINK)),
-    Store("Webhallen", "webhallen.com",
-          "https://www.webhallen.com/se/search?searchString={q}",
-          re.compile(r"/se/product/\d+" + r"[^\s\"'<>\\?#]*"),
-          re.compile(r"/product/(\d+)")),
-    Store("Komplett", "komplett.se",
-          "https://www.komplett.se/search?q={q}",
-          re.compile(r"/product/\d+" + r"[^\s\"'<>\\?#]*"),
-          re.compile(r"/product/(\d+)")),
-    Store("Inet", "inet.se",
-          "https://www.inet.se/hitta?q={q}",
-          re.compile(r"/produkt/\d+" + r"[^\s\"'<>\\?#]*"),
-          re.compile(r"/produkt/(\d+)")),
-    Store("MediaMarkt", "mediamarkt.se",
-          "https://www.mediamarkt.se/sv/search.html?query={q}",
-          re.compile(r"/sv/product/" + _LINK),
-          re.compile(r"-(\d{5,})\.html$")),
-    Store("Kjell", "kjell.com",
-          "https://www.kjell.com/se/sok?query={q}",
-          re.compile(r"/se/[^\s\"'<>\\?#]*/p/\d+"),
-          re.compile(r"/p/(\d+)")),
-]
+# Tuned settings for shops we know. "key" keeps product IDs stable even if you
+# rename the shop in stores.txt.
+KNOWN = {
+    "elgiganten.se": dict(
+        key="Elgiganten",
+        search_url="https://www.elgiganten.se/search?q={q}&view=products",
+        product_re=re.compile(r"/product/" + _LINK)),
+    "netonnet.se": dict(
+        key="NetOnNet",
+        search_url="https://www.netonnet.se/search?query={q}",
+        product_re=re.compile(r"/art/" + _LINK)),
+    "webhallen.com": dict(
+        key="Webhallen",
+        search_url="https://www.webhallen.com/se/search?searchString={q}",
+        product_re=re.compile(r"/se/product/\d+" + r"[^\s\"'<>\\?#]*"),
+        id_re=re.compile(r"/product/(\d+)")),
+    "komplett.se": dict(
+        key="Komplett",
+        search_url="https://www.komplett.se/search?q={q}",
+        product_re=re.compile(r"/product/\d+" + r"[^\s\"'<>\\?#]*"),
+        id_re=re.compile(r"/product/(\d+)")),
+    "inet.se": dict(
+        key="Inet",
+        search_url="https://www.inet.se/hitta?q={q}",
+        product_re=re.compile(r"/produkt/\d+" + r"[^\s\"'<>\\?#]*"),
+        id_re=re.compile(r"/produkt/(\d+)")),
+    "mediamarkt.se": dict(
+        key="MediaMarkt",
+        search_url="https://www.mediamarkt.se/sv/search.html?query={q}",
+        product_re=re.compile(r"/sv/product/" + _LINK),
+        id_re=re.compile(r"-(\d{5,})\.html$")),
+    "kjell.com": dict(
+        key="Kjell",
+        search_url="https://www.kjell.com/se/sok?query={q}",
+        product_re=re.compile(r"/se/[^\s\"'<>\\?#]*/p/\d+"),
+        id_re=re.compile(r"/p/(\d+)")),
+}
+
+STORES: list = []          # filled from stores.txt in main()
+
+DEFAULT_STORES_TXT = """# Stores to search - one per line:   Name - home URL
+# Lines starting with # are ignored.
+# If a shop's search page cannot be detected automatically, add its search URL
+# (with {q} where the search words go) as a third part, e.g.
+#   Power - https://www.power.se - https://www.power.se/search/?q={q}
+
+Elgiganten - https://www.elgiganten.se
+NetOnNet - https://www.netonnet.se
+Webhallen - https://www.webhallen.com/se
+Inet - https://www.inet.se
+MediaMarkt - https://www.mediamarkt.se
+Kjell - https://www.kjell.com/se
+# Komplett - https://www.komplett.se     (reset our connections in testing)
+"""
+
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _domain_of(url: str) -> str:
+    host = urlsplit(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def make_store(name: str, home: str, search_template: Optional[str] = None) -> Store:
+    """Build a Store from a stores.txt entry, using tuned settings when the shop is known."""
+    domain = _domain_of(home)
+    known = next((v for d, v in KNOWN.items() if domain.endswith(d)), {})
+    return Store(name=name, domain=domain, home=home,
+                 search_url=search_template or known.get("search_url"),
+                 product_re=known.get("product_re"), id_re=known.get("id_re"),
+                 key=known.get("key", domain))
+
+
+def parse_store_line(line: str):
+    """'Name - https://home[ - https://search?q={q}]' -> (name, home, template) or None."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    urls = _URL_RE.findall(line)
+    if urls:
+        name_part = line[:line.index(urls[0])]
+    else:                                        # allow a bare domain: "NetOnNet - www.netonnet.se"
+        m = re.search(r"(?:^|\s)((?:[\w-]+\.)+[a-z]{2,}(?:/\S*)?)\s*$", line, re.I)
+        if not m:
+            raise ValueError("no URL found")
+        urls = ["https://" + m.group(1)]
+        name_part = line[:m.start(1)]
+    home = urls[0].rstrip(",;")
+    template = next((u.rstrip(",;") for u in urls[1:] if "{q}" in u), None)
+    name = name_part.strip(" \t-\u2013\u2014:,|=").strip() or _domain_of(home).split(".")[0].capitalize()
+    return name, home, template
+
+
+def load_stores(path: Path) -> list:
+    """Read stores.txt (creating a default one if it does not exist)."""
+    if not path.exists():
+        path.write_text(DEFAULT_STORES_TXT, encoding="utf-8")
+        log.info("Created %s with a default list of stores - edit it to add or remove shops.", path)
+    stores: list = []
+    seen: set = set()
+    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        try:
+            parsed = parse_store_line(line)
+        except ValueError as exc:
+            log.warning("%s line %d ignored (%s): %s", path.name, number, exc, line.strip())
+            continue
+        if not parsed:
+            continue
+        store = make_store(*parsed)
+        if store.domain in seen:
+            log.warning("%s line %d ignored: %s is listed twice", path.name, number, store.domain)
+            continue
+        seen.add(store.domain)
+        stores.append(store)
+    return stores
 
 
 def store_for_url(url: str) -> Optional[Store]:
     host = urlsplit(url).netloc.lower()
-    return next((s for s in STORES if host.endswith(s.domain)), None)
-
-
-def store_by_name(name: str) -> Optional[Store]:
-    return next((s for s in STORES if s.name.lower() == name.lower()), None)
+    for store in STORES:
+        if host.endswith(store.domain):
+            return store
+    for domain, cfg in KNOWN.items():            # shop no longer in stores.txt, but still known
+        if host.endswith(domain):
+            return make_store(cfg["key"], f"https://{host}")
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -247,7 +344,7 @@ def parse_query(raw: str, excludes: Optional[list] = None,
     )
 
 
-def relevance(query: Query, *texts: str) -> Optional[float]:
+def relevance(query: Query, *texts: str, min_score: float = 0.6) -> Optional[float]:
     """
     Score 0..1 for how well the given texts (link text, URL path, product name)
     match the query, or None if the result must be rejected.
@@ -261,7 +358,7 @@ def relevance(query: Query, *texts: str) -> Optional[float]:
     if any(token not in haystack for token in query.must):
         return None
     score = sum(token in haystack for token in query.tokens) / len(query.tokens)
-    return score if score >= 0.6 else None
+    return score if score >= min_score else None
 
 
 # --------------------------------------------------------------------------- #
@@ -515,7 +612,7 @@ def product_id_for(url: str, store: Optional[Store]) -> str:
     if store and store.id_re:
         match = store.id_re.search(path)
         if match:
-            return hashlib.sha1(f"{store.name}:{match.group(1)}".encode()).hexdigest()[:12]
+            return hashlib.sha1(f"{store.key}:{match.group(1)}".encode()).hexdigest()[:12]
     return hashlib.sha1(canonicalize(url).encode()).hexdigest()[:12]
 
 
@@ -687,29 +784,76 @@ def extract_product_data(html: str, name_selector: Optional[str] = None,
 # Store search: find candidate product URLs
 # --------------------------------------------------------------------------- #
 
+_MONEY_RE = re.compile(r"\d[\d\s\u00a0.,]*\s?(?:kr|:-|sek)\b", re.I)
+_ASSET_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|svg|pdf|xml|css|js|ico)$", re.I)
+_SKIP_HREF = ("#", "javascript:", "mailto:", "tel:")
+
+
+def _is_product_like(store: Store, url: str) -> bool:
+    """Known shops: product_re decides. Unknown shops: any real page (verified later)."""
+    path = urlsplit(url).path
+    if store.product_re is not None:
+        return bool(store.product_re.search(path))
+    return path not in ("", "/") and not _ASSET_RE.search(path)
+
+
+def _price_card_text(anchor) -> Optional[str]:
+    """Text of the product 'card' around a link, if that card shows a price."""
+    node = anchor
+    for _ in range(5):
+        if node is None or not hasattr(node, "get_text"):
+            return None
+        text = node.get_text(" ", strip=True)
+        if len(text) > 600:                       # climbed into the whole page: not a card
+            return None
+        if len({a.get("href") for a in node.find_all("a", href=True)}) > 3:
+            return None                           # a container of many links, not one product card
+        if _MONEY_RE.search(text):
+            return text
+        node = node.parent
+    return None
+
+
 def find_ranked_links(html: str, store: Store, base_url: str, query: Query) -> list:
     """
     Collect product-page URLs from a search results page and rank them by how
-    well they match the query. Links come from <a> tags AND from any product
-    paths hidden in embedded JSON (__NEXT_DATA__ etc.), so JS-framework sites
-    that ship their results as JSON still work.
+    well they match the query.
+
+    Known shops: links matching the shop's product_re, from <a> tags AND from
+    paths hidden in embedded JSON (__NEXT_DATA__ etc.).
+    Other shops: links that sit inside a card showing a price, plus JSON-LD
+    item lists. Wrong guesses are weeded out when the page itself is read.
     """
     soup = BeautifulSoup(html, "html.parser")
     found: dict = {}                      # product_id -> {"url": ..., "text": ...}
 
     def add(href: str, text: str = "") -> None:
         url = canonicalize(urljoin(base_url, href))
-        parts = urlsplit(url)
-        if not parts.netloc.endswith(store.domain) or not store.product_re.search(parts.path):
+        if not urlsplit(url).netloc.endswith(store.domain) or not _is_product_like(store, url):
             return
         entry = found.setdefault(product_id_for(url, store), {"url": url, "text": ""})
         if text and text not in entry["text"]:
             entry["text"] += " " + text
 
     for a in soup.find_all("a", href=True):
-        add(a["href"], a.get_text(" ", strip=True)[:200])
-    for match in store.product_re.finditer(html.replace("\\/", "/")):
-        add(match.group(0))
+        href = a["href"].strip()
+        if href.startswith(_SKIP_HREF):
+            continue
+        if store.product_re is not None:
+            add(href, a.get_text(" ", strip=True)[:200])
+        else:
+            card = _price_card_text(a)
+            if card:
+                add(href, card[:300])
+
+    if store.product_re is not None:
+        for match in store.product_re.finditer(html.replace("\\/", "/")):
+            add(match.group(0))
+    else:
+        for node in _iter_jsonld(soup):
+            url = node.get("url")
+            if isinstance(url, str) and (_has_type(node, "Product") or _has_type(node, "ListItem")):
+                add(url, str(node.get("name") or ""))
 
     ranked = []
     for order, entry in enumerate(found.values()):
@@ -740,15 +884,100 @@ def scrape_product(url: str, store_name: str, query: Optional[Query] = None,
     name, price, currency = fetch_and_extract(url, extractor)
     if currency != "SEK":
         raise ExtractionError(f"unexpected currency {currency}")
-    return Product(product_id_for(url, store_by_name(store_name)),
+    return Product(product_id_for(url, store_for_url(url)),
                    store_name, name, price, canonicalize(url), currency)
 
 
-def search_store(store: Store, query: Query, max_results: int) -> list:
-    """Search one store and return up to `max_results` scraped Products."""
-    search_url = store.search_url.format(q=quote_plus(query.keywords))
-    log.info("[%s] searching: %s", store.name, search_url)
+def fill_search_url(template: str, keywords: str) -> str:
+    return template.replace("{q}", quote_plus(keywords))
+
+
+def _load_json(path: Path) -> dict:
     try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+_SEARCH_FIELD_RE = re.compile(
+    r"^(q|query|search|s|searchstring|searchterm|text|keyword|keywords|sok|term)$", re.I)
+
+
+def _find_search_template(html: str, home: str) -> str:
+    """Detect a shop's search URL (as a template with {q}) from its home page."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. schema.org SearchAction in JSON-LD - the shop declares its search URL itself
+    for node in _iter_jsonld(soup):
+        actions = node.get("potentialAction")
+        for action in (actions if isinstance(actions, list) else [actions]):
+            if isinstance(action, dict) and _has_type(action, "SearchAction"):
+                target = action.get("target")
+                if isinstance(target, dict):
+                    target = target.get("urlTemplate")
+                if isinstance(target, str) and "{" in target:
+                    return re.sub(r"\{[^}]*\}", "{q}", urljoin(home, target))
+
+    # 2. an ordinary GET search form
+    for form in soup.find_all("form"):
+        if (form.get("method") or "get").lower() != "get":
+            continue
+        field = (form.find("input", attrs={"type": "search"})
+                 or form.find("input", attrs={"name": _SEARCH_FIELD_RE}))
+        if not field or not field.get("name"):
+            continue
+        action = urljoin(home, form.get("action") or home)
+        params = [f"{quote_plus(field['name'])}={{q}}"]
+        for hidden in form.find_all("input", attrs={"type": "hidden"}):
+            if hidden.get("name") and hidden.get("value"):
+                params.append(f"{quote_plus(hidden['name'])}={quote_plus(hidden['value'])}")
+        return action + ("&" if "?" in action else "?") + "&".join(params)
+
+    raise ExtractionError("could not detect the search page - add its URL (with {q}) in stores.txt")
+
+
+def resolve_search_template(store: Store) -> str:
+    """The shop's search URL template: from stores.txt/KNOWN, the cache, or auto-detected."""
+    if store.search_url:
+        return store.search_url
+    cache_file = CACHE_DIR / "search_urls.json"
+    cache = _load_json(cache_file)
+    if store.domain in cache:
+        return cache[store.domain]
+    log.info("[%s] detecting the search page from %s", store.name, store.home)
+    template = fetch_and_extract(store.home, lambda html: _find_search_template(html, store.home))
+    cache[store.domain] = template
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+        cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    log.info("[%s] search page: %s", store.name, template)
+    return template
+
+
+def _skip_label(exc: Exception) -> str:
+    message = str(exc)
+    if "does not match" in message:
+        return "name mismatch"
+    if "min-price" in message or "max-price" in message:
+        return "price filter"
+    if isinstance(exc, RobotsDisallowed):
+        return "robots.txt"
+    return "error"
+
+
+def search_store(store: Store, query: Query, max_results: int) -> list:
+    """
+    Search one store. Candidates are checked one by one until `max_results`
+    have been ACCEPTED (or a check budget is used up), so rejected candidates
+    (accessories, price filter ...) do not reduce the result count.
+    """
+    source = "search page"
+    try:
+        template = resolve_search_template(store)
+        search_url = fill_search_url(template, query.keywords)
+        log.info("[%s] searching: %s", store.name, search_url)
         links = fetch_and_extract(
             search_url, lambda html: find_ranked_links(html, store, search_url, query))
     except (RobotsDisallowed, ExtractionError) as exc:
@@ -757,19 +986,35 @@ def search_store(store: Store, query: Query, max_results: int) -> list:
             links = sitemap_links(store, query)
         except (FetchError, ExtractionError) as exc2:
             raise ExtractionError(f"search: {exc}; sitemap: {exc2}") from exc2
-    log.info("[%s] %d matching link(s), checking top %d",
-             store.name, len(links), min(len(links), max_results))
+        source = "sitemap"
 
-    products = []
-    for link in links[:max_results]:
+    max_checks = max(max_results * 4, 12)
+    log.info("[%s] %d candidate(s) from the %s; checking until %d match (max %d page checks)",
+             store.name, len(links), source, max_results, max_checks)
+
+    products: list = []
+    skipped: Counter = Counter()
+    checked = 0
+    for link in links:
+        if len(products) >= max_results or checked >= max_checks:
+            break
+        checked += 1
         try:
             products.append(scrape_product(link, store.name, query))
-        except RobotsDisallowed as exc:
-            log.warning("[%s] skipped %s: %s", store.name, link, exc)
         except (FetchError, ExtractionError) as exc:
-            log.warning("[%s] skipped %s: %s", store.name, link, exc)
+            label = _skip_label(exc)
+            skipped[label] += 1
+            (log.warning if label == "error" else log.debug)(
+                "[%s] skipped %s: %s", store.name, link, exc)
+
+    detail = ", ".join(f"{n} {label}" for label, n in skipped.items()) or "none"
+    log.info("[%s] checked %d page(s): %d accepted, skipped: %s",
+             store.name, checked, len(products), detail)
     if not products:
-        raise ExtractionError("matching links found but no product page could be parsed")
+        raise ExtractionError(f"{len(links)} candidate(s) but none usable (skipped: {detail})")
+    if len(products) < max_results and checked < len(links):
+        log.info("[%s] stopped after %d checks - raise --max-per-store to look further",
+                 store.name, checked)
     return products
 
 
@@ -787,7 +1032,7 @@ MAX_SITEMAP_BYTES = 60_000_000
 
 
 def _site_base(store: Store) -> str:
-    parts = urlsplit(store.search_url)
+    parts = urlsplit(store.home)
     return f"{parts.scheme}://{parts.netloc}"
 
 
@@ -818,7 +1063,7 @@ def _fetch_sitemap(url: str) -> str:
 
 def load_store_urls(store: Store) -> list:
     """Every product URL listed in the store's sitemaps (cached for a week)."""
-    cache = CACHE_DIR / f"{store.name.lower()}_urls.txt.gz"
+    cache = CACHE_DIR / f"{store.domain}_urls.txt.gz"
     if cache.exists() and time.time() - cache.stat().st_mtime < SITEMAP_TTL:
         return gzip.decompress(cache.read_bytes()).decode("utf-8").splitlines()
 
@@ -847,7 +1092,7 @@ def load_store_urls(store: Store) -> list:
             queue.extend([l for l in locs if "product" in l.lower()] or locs)
         else:
             urls.extend(canonicalize(l) for l in locs
-                        if store.product_re.search(urlsplit(l).path))
+                        if _is_product_like(store, l))
     if queue and files >= MAX_SITEMAP_FILES:
         log.warning("[%s] stopped after %d sitemap files (list may be incomplete)",
                     store.name, MAX_SITEMAP_FILES)
@@ -862,7 +1107,9 @@ def sitemap_links(store: Store, query: Query) -> list:
     """Rank sitemap URLs by how well their slug matches the query."""
     ranked = []
     for order, url in enumerate(load_store_urls(store)):
-        score = relevance(query, urlsplit(url).path)
+        # Loose pre-filter: slugs often lack the brand. The page's real name is
+        # checked strictly later, in scrape_product().
+        score = relevance(query, urlsplit(url).path, min_score=0.4)
         if score is not None:
             ranked.append((-score, order, url))
     ranked.sort()
@@ -1065,16 +1312,23 @@ def run_search(conn: sqlite3.Connection, query: Query, args) -> dict:
 def check_stores() -> None:
     """Report which stores permit automated search pages and publish sitemaps."""
     CFG.respect_robots = True
+    cache = _load_json(CACHE_DIR / "search_urls.json")
     for store in STORES:
         base = _site_base(store)
-        search_ok = allowed_by_robots(store.search_url.format(q="test"))
+        template = store.search_url or cache.get(store.domain)
+        if template:
+            ok = allowed_by_robots(fill_search_url(template, "test"))
+            search_note = "allowed" if ok else "DISALLOWED"
+        else:
+            allowed_by_robots(base + "/")                   # loads robots.txt
+            search_note = "detected on first search"
         parser = _ROBOTS.get(base)
         if parser is None:
             note = "robots.txt unreadable"
         else:
             maps = parser.site_maps()
             note = f"{len(maps) if maps else 0} sitemap(s) listed"
-        print(f"  {store.name:<12} search pages: {'allowed' if search_ok else 'DISALLOWED':<10} {note}")
+        print(f"  {store.name:<14} search pages: {search_note:<26} {note}")
 
 
 def run_recheck(conn: sqlite3.Connection) -> dict:
@@ -1176,12 +1430,15 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--price-selector", help="(with --url) optional CSS selector override")
 
     opt = p.add_argument_group("options")
-    opt.add_argument("--stores", nargs="+", type=str.lower,
-                     choices=[s.name.lower() for s in STORES], metavar="STORE",
-                     help="Only search these stores (default: all). Choices: "
-                          + ", ".join(s.name.lower() for s in STORES))
-    opt.add_argument("--max-per-store", type=int, default=3,
-                     help="Max products to track per store (default 3)")
+    opt.add_argument("--stores-file", default=str(Path(__file__).with_name("stores.txt")),
+                     help="File listing the shops to search, one 'Name - home URL' per line "
+                          "(default: stores.txt next to this script)")
+    opt.add_argument("--stores", nargs="+", type=str.lower, metavar="STORE",
+                     help="Only search these shops from the file (default: all)")
+    opt.add_argument("--max-per-store", type=int, default=10,
+                     help="Products to collect per store (default 10)")
+    opt.add_argument("--refresh-cache", action="store_true",
+                     help="Delete cached sitemaps and detected search pages first")
     opt.add_argument("--exclude", nargs="+", default=[],
                      help="Words that disqualify a result, e.g. --exclude fodral skal")
     opt.add_argument("--min-price", type=float, help="Ignore results cheaper than this (SEK)")
@@ -1223,6 +1480,22 @@ def main() -> int:
     if CFG.js_mode == "always" and not playwright_available():
         log.error("--js always needs Playwright: pip install playwright && playwright install chromium")
         return 1
+
+    if args.refresh_cache and CACHE_DIR.exists():
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+        log.info("Cache cleared.")
+
+    STORES[:] = load_stores(Path(args.stores_file))
+    if not STORES:
+        log.error("No stores found in %s", args.stores_file)
+        return 1
+    if args.stores:
+        names = {st.name.lower() for st in STORES}
+        unknown = [n for n in args.stores if n not in names]
+        if unknown:
+            log.error("Unknown store(s): %s. Stores in %s: %s", ", ".join(unknown),
+                      args.stores_file, ", ".join(sorted(names)))
+            return 1
 
     if args.check_stores:
         check_stores()
