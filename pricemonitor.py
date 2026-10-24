@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 price_monitor.py - Search Swedish web shops for a product and track its price.
+requires playwright anb playwright chromium for JavaScript-rendered pages (optional).
 
 Usage
 -----
@@ -13,8 +14,8 @@ Usage
     # List what is tracked, with the latest price
     python price_monitor.py --list
 
-    # Track one specific page (selectors optional - they are auto-detected)
-    python price_monitor.py --url "https://www.example.se/produkt/123"
+    # Track specific product pages (selectors are auto-detected) - then use --recheck
+    python price_monitor.py --url "https://www.example.se/produkt/123" "https://www.example.se/produkt/456"
 
     # Useful options
     python price_monitor.py --search "iPhone 15 128GB" --exclude fodral skal \
@@ -195,6 +196,7 @@ class Product:
 # --------------------------------------------------------------------------- #
 
 _ALNUM = "0-9a-zåäöé"
+_STOPWORDS = {"the", "a", "an", "and", "of", "för", "och", "med", "till", "en", "ett"}
 _TOKEN_RE = re.compile(rf"[{_ALNUM}]+(?:[-.][{_ALNUM}]+)*")
 
 
@@ -216,6 +218,7 @@ def parse_query(raw: str, excludes: Optional[list] = None) -> Query:
     """Clean a free-text query into search keywords + matching rules."""
     cleaned = " ".join(raw.replace("\u00a0", " ").split())
     raw_tokens = list(dict.fromkeys(_TOKEN_RE.findall(cleaned.lower())))  # de-duplicated
+    raw_tokens = [t for t in raw_tokens if t not in _STOPWORDS] or raw_tokens
     tokens = [t for t in (normalize(t) for t in raw_tokens) if t]
     if not tokens:
         raise ValueError("The search query contains no usable words.")
@@ -301,8 +304,8 @@ def _to_number(value) -> Optional[float]:
 
 def _build_session() -> requests.Session:
     session = requests.Session()
-    retry = Retry(total=2, backoff_factor=1.0, status_forcelist=(500, 502, 504),
-                  allowed_methods=("GET",))
+    retry = Retry(total=1, connect=0, read=0, backoff_factor=1.0,
+                  status_forcelist=(500, 502, 504), allowed_methods=("GET",))
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
@@ -325,7 +328,7 @@ def allowed_by_robots(url: str) -> bool:
     if base not in _ROBOTS:
         parser: Optional[RobotFileParser] = None
         try:
-            resp = SESSION.get(base + "/robots.txt", timeout=CFG.timeout)
+            resp = SESSION.get(base + "/robots.txt", timeout=8)
             if resp.status_code == 200:
                 parser = RobotFileParser()
                 parser.parse(resp.text.splitlines())
@@ -339,9 +342,9 @@ def allowed_by_robots(url: str) -> bool:
 def fetch_requests(url: str) -> str:
     """Download a page with plain `requests`."""
     if not allowed_by_robots(url):
-        raise RobotsDisallowed("disallowed by robots.txt (override with --ignore-robots)")
+        raise RobotsDisallowed("disallowed by robots.txt - add product pages directly with --url")
     try:
-        resp = SESSION.get(url, timeout=CFG.timeout)
+        resp = SESSION.get(url, timeout=(8, CFG.timeout))
     except requests.exceptions.Timeout as exc:
         raise FetchError(f"timed out after {CFG.timeout}s") from exc
     except requests.exceptions.RequestException as exc:
@@ -403,7 +406,7 @@ atexit.register(close_browser)
 def fetch_playwright(url: str) -> str:
     """Download a page with a headless browser (renders JavaScript)."""
     if not allowed_by_robots(url):
-        raise RobotsDisallowed("disallowed by robots.txt (override with --ignore-robots)")
+        raise RobotsDisallowed("disallowed by robots.txt - add product pages directly with --url")
     try:
         page = _playwright_context().new_page()
         try:
@@ -434,9 +437,11 @@ def fetch_and_extract(url: str, extractor: Callable[[str], object]):
     """
     Fetch `url` and run `extractor(html)` on it.
 
-    In 'auto' mode we try plain requests first; if that fails OR the extractor
-    finds nothing (typical for JavaScript-rendered pages), we retry with
-    Playwright when it is installed.
+    In 'auto' mode we try plain requests first. If the page LOADED but the
+    extractor found nothing (typical for JavaScript-rendered pages), we render it
+    with Playwright when it is installed. If the shop refused or reset the
+    connection we stop: a browser would not change that, and this tool does not
+    try to get around blocks.
     """
     if CFG.js_mode == "never":
         modes = [False]
@@ -457,9 +462,18 @@ def fetch_and_extract(url: str, extractor: Callable[[str], object]):
             last_error = ExtractionError("nothing usable found")
         except RobotsDisallowed:
             raise                                     # retrying with JS would not help
-        except (FetchError, ExtractionError) as exc:
+        except FetchError as exc:
             last_error = exc
-            log.debug("Attempt (js=%s) failed for %s: %s", use_js, url, exc)
+            if not use_js and CFG.js_mode == "auto":
+                break                                 # blocked/unreachable: give up on this page
+        except ExtractionError as exc:
+            last_error = exc
+            log.debug("Attempt (js=%s) found nothing at %s: %s", use_js, url, exc)
+    if (isinstance(last_error, ExtractionError) and CFG.js_mode != "always"
+            and not playwright_available()):
+        last_error = ExtractionError(
+            f"{last_error} - the page may be JavaScript-rendered; install Playwright: "
+            "pip install playwright && playwright install chromium")
     raise last_error
 
 
@@ -896,24 +910,38 @@ def run_recheck(conn: sqlite3.Connection) -> dict:
         except Exception as exc:        # keep going if a single page fails
             log.error("[%s] %s: %s", store_name, url, exc)
             counts["failed"].append(str(exc))
-    return {k: (f"OK       {v['ok']} product(s)" if not v["failed"]
-                else f"PARTIAL  {v['ok']} ok, {len(v['failed'])} failed: {v['failed'][0]}")
-            for k, v in status.items()}
+    return _format_status(status)
+
+
+def _format_status(status: dict) -> dict:
+    out = {}
+    for store, v in status.items():
+        if not v["failed"]:
+            out[store] = f"OK       {v['ok']} product(s)"
+        elif v["ok"] == 0:
+            out[store] = f"FAILED   {v['failed'][0]}"
+        else:
+            out[store] = f"PARTIAL  {v['ok']} ok, {len(v['failed'])} failed: {v['failed'][0]}"
+    return out
 
 
 def run_single_url(conn: sqlite3.Connection, args) -> dict:
-    """Track one explicit URL (selectors optional)."""
-    store = store_for_url(args.url)
-    store_name = store.name if store else urlsplit(args.url).netloc
-    try:
-        product = scrape_product(args.url, store_name,
-                                 name_selector=args.name_selector,
-                                 price_selector=args.price_selector)
-        handle_product(conn, product, None)
-        return {store_name: "OK       1 product(s)"}
-    except Exception as exc:
-        log.error("[%s] failed: %s", store_name, exc)
-        return {store_name: f"FAILED   {exc}"}
+    """Track one or more explicit product-page URLs (selectors optional)."""
+    status: dict = {}
+    for url in args.url:
+        store = store_for_url(url)
+        store_name = store.name if store else urlsplit(url).netloc
+        counts = status.setdefault(store_name, {"ok": 0, "failed": []})
+        try:
+            product = scrape_product(url, store_name,
+                                     name_selector=args.name_selector,
+                                     price_selector=args.price_selector)
+            handle_product(conn, product, None)
+            counts["ok"] += 1
+        except Exception as exc:
+            log.error("[%s] %s: %s", store_name, url, exc)
+            counts["failed"].append(str(exc))
+    return _format_status(status)
 
 
 def list_tracked(conn: sqlite3.Connection) -> None:
@@ -954,7 +982,7 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--search", help='Product to look for, e.g. "Sony WH-1000XM5"')
     mode.add_argument("--recheck", action="store_true", help="Re-scan all tracked products")
     mode.add_argument("--list", action="store_true", help="List tracked products")
-    mode.add_argument("--url", help="Track one specific product URL")
+    mode.add_argument("--url", nargs="+", help="Track specific product page URL(s)")
     mode.add_argument("--name-selector", help="(with --url) optional CSS selector override")
     mode.add_argument("--price-selector", help="(with --url) optional CSS selector override")
 
