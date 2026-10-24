@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 price_monitor.py - Search Swedish web shops for a product and track its price.
-requires playwright anb playwright chromium for JavaScript-rendered pages (optional).
 
 Usage
 -----
@@ -13,6 +12,9 @@ Usage
 
     # List what is tracked, with the latest price
     python price_monitor.py --list
+
+    # Which stores permit automated search pages? (reads each store's robots.txt)
+    python price_monitor.py --check-stores
 
     # Track specific product pages (selectors are auto-detected) - then use --recheck
     python price_monitor.py --url "https://www.example.se/produkt/123" "https://www.example.se/produkt/456"
@@ -27,6 +29,8 @@ How it works
    (model numbers such as "wh-1000xm5") MUST appear in a result to count as a match.
 2. Each store's search page is fetched and product links are collected from
    <a> tags AND from JSON embedded in the page (works for Next.js-style sites).
+   If a store's robots.txt forbids its search page, the store's own published
+   sitemap is used to find matching product pages instead (cached for 7 days).
 3. The best-matching product pages are fetched and parsed WITHOUT per-store CSS
    selectors, using, in order: JSON-LD (schema.org Product), microdata
    (itemprop="price"), OpenGraph/product meta tags, and common price CSS patterns.
@@ -44,7 +48,9 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import gzip
 import hashlib
+import html as htmllib
 import json
 import logging
 import random
@@ -145,6 +151,10 @@ STORES = [
           "https://www.inet.se/hitta?q={q}",
           re.compile(r"/produkt/\d+" + r"[^\s\"'<>\\?#]*"),
           re.compile(r"/produkt/(\d+)")),
+    Store("MediaMarkt", "mediamarkt.se",
+          "https://www.mediamarkt.se/sv/search.html?query={q}",
+          re.compile(r"/sv/product/" + _LINK),
+          re.compile(r"-(\d{5,})\.html$")),
     Store("Kjell", "kjell.com",
           "https://www.kjell.com/se/sok?query={q}",
           re.compile(r"/se/[^\s\"'<>\\?#]*/p/\d+"),
@@ -212,9 +222,13 @@ class Query:
     tokens: list           # normalised tokens used for matching
     must: list             # tokens that contain digits (model numbers) - mandatory
     excludes: list         # normalised words that disqualify a result
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
 
 
-def parse_query(raw: str, excludes: Optional[list] = None) -> Query:
+def parse_query(raw: str, excludes: Optional[list] = None,
+                min_price: Optional[float] = None,
+                max_price: Optional[float] = None) -> Query:
     """Clean a free-text query into search keywords + matching rules."""
     cleaned = " ".join(raw.replace("\u00a0", " ").split())
     raw_tokens = list(dict.fromkeys(_TOKEN_RE.findall(cleaned.lower())))  # de-duplicated
@@ -228,6 +242,8 @@ def parse_query(raw: str, excludes: Optional[list] = None) -> Query:
         tokens=tokens,
         must=[t for t in tokens if any(c.isdigit() for c in t)],
         excludes=[normalize(e) for e in (excludes or []) if normalize(e)],
+        min_price=min_price,
+        max_price=max_price,
     )
 
 
@@ -236,9 +252,12 @@ def relevance(query: Query, *texts: str) -> Optional[float]:
     Score 0..1 for how well the given texts (link text, URL path, product name)
     match the query, or None if the result must be rejected.
     """
-    haystack = normalize(" ".join(texts))
-    if any(word in haystack for word in query.excludes):
+    joined = " ".join(texts)
+    # Excluded words match whole words only ("ram" must not reject "fRAMe").
+    words = re.findall(rf"[{_ALNUM}]+", joined.lower())
+    if any(w.startswith(e) for e in query.excludes for w in words):
         return None
+    haystack = normalize(joined)
     if any(token not in haystack for token in query.must):
         return None
     score = sum(token in haystack for token in query.tokens) / len(query.tokens)
@@ -700,7 +719,7 @@ def find_ranked_links(html: str, store: Store, base_url: str, query: Query) -> l
     ranked.sort()
     if not ranked:
         raise ExtractionError(
-            f"{len(found)} product link(s) seen, none matching '{query.raw}'")
+            f"{len(found)} product link(s) seen, none matching '{query.keywords}'")
     return [url for _, _, url in ranked]
 
 
@@ -712,6 +731,10 @@ def scrape_product(url: str, store_name: str, query: Optional[Query] = None,
         name, price, currency = extract_product_data(html, name_selector, price_selector)
         if query and relevance(query, name, urlsplit(url).path) is None:
             raise ExtractionError(f"page '{name[:60]}' does not match the search")
+        if query and query.min_price is not None and price < query.min_price:
+            raise ExtractionError(f"price {price:g} kr is below --min-price")
+        if query and query.max_price is not None and price > query.max_price:
+            raise ExtractionError(f"price {price:g} kr is above --max-price")
         return name, price, currency
 
     name, price, currency = fetch_and_extract(url, extractor)
@@ -725,8 +748,15 @@ def search_store(store: Store, query: Query, max_results: int) -> list:
     """Search one store and return up to `max_results` scraped Products."""
     search_url = store.search_url.format(q=quote_plus(query.keywords))
     log.info("[%s] searching: %s", store.name, search_url)
-    links = fetch_and_extract(
-        search_url, lambda html: find_ranked_links(html, store, search_url, query))
+    try:
+        links = fetch_and_extract(
+            search_url, lambda html: find_ranked_links(html, store, search_url, query))
+    except (RobotsDisallowed, ExtractionError) as exc:
+        log.info("[%s] search page not usable (%s) - trying the store's sitemap", store.name, exc)
+        try:
+            links = sitemap_links(store, query)
+        except (FetchError, ExtractionError) as exc2:
+            raise ExtractionError(f"search: {exc}; sitemap: {exc2}") from exc2
     log.info("[%s] %d matching link(s), checking top %d",
              store.name, len(links), min(len(links), max_results))
 
@@ -741,6 +771,107 @@ def search_store(store: Store, query: Query, max_results: int) -> list:
     if not products:
         raise ExtractionError("matching links found but no product page could be parsed")
     return products
+
+
+# --------------------------------------------------------------------------- #
+# Discovery through the store's published sitemaps
+# --------------------------------------------------------------------------- #
+# Sitemaps are files shops publish *for* automated clients. When a store's
+# robots.txt forbids its search page, we can still find matching product pages
+# by name in the sitemap (product pages are checked against robots.txt too).
+
+CACHE_DIR = Path(".price_monitor_cache")
+SITEMAP_TTL = 7 * 24 * 3600
+MAX_SITEMAP_FILES = 40
+MAX_SITEMAP_BYTES = 60_000_000
+
+
+def _site_base(store: Store) -> str:
+    parts = urlsplit(store.search_url)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _sitemaps_listed_in_robots(base: str) -> list:
+    allowed_by_robots(base + "/")                   # makes sure robots.txt is loaded
+    parser = _ROBOTS.get(base)
+    maps = parser.site_maps() if parser else None
+    return list(maps) if maps else [base + "/sitemap.xml"]
+
+
+def _fetch_sitemap(url: str) -> str:
+    if not allowed_by_robots(url):
+        raise RobotsDisallowed("sitemap disallowed by robots.txt")
+    _polite_delay()
+    try:
+        resp = SESSION.get(url, timeout=(8, 60))
+    except requests.exceptions.RequestException as exc:
+        raise FetchError(f"sitemap network error: {exc}") from exc
+    if resp.status_code != 200:
+        raise FetchError(f"sitemap HTTP {resp.status_code}")
+    data = resp.content
+    if data[:2] == b"\x1f\x8b":                      # .xml.gz
+        data = gzip.decompress(data)
+    if len(data) > MAX_SITEMAP_BYTES:
+        raise FetchError("sitemap too large")
+    return data.decode("utf-8", errors="replace")
+
+
+def load_store_urls(store: Store) -> list:
+    """Every product URL listed in the store's sitemaps (cached for a week)."""
+    cache = CACHE_DIR / f"{store.name.lower()}_urls.txt.gz"
+    if cache.exists() and time.time() - cache.stat().st_mtime < SITEMAP_TTL:
+        return gzip.decompress(cache.read_bytes()).decode("utf-8").splitlines()
+
+    log.info("[%s] reading the store's sitemaps (first run is slow, then cached 7 days)",
+             store.name)
+    queue = _sitemaps_listed_in_robots(_site_base(store))
+    seen: set = set()
+    urls: list = []
+    files = 0
+    last_error: Optional[Exception] = None
+    while queue and files < MAX_SITEMAP_FILES:
+        sitemap = queue.pop(0)
+        if sitemap in seen:
+            continue
+        seen.add(sitemap)
+        try:
+            xml = _fetch_sitemap(sitemap)
+        except FetchError as exc:
+            last_error = exc
+            log.debug("[%s] %s: %s", store.name, sitemap, exc)
+            continue
+        files += 1
+        locs = [htmllib.unescape(m.strip()) for m in re.findall(
+            r"<loc>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</loc>", xml, re.S)]
+        if "<sitemapindex" in xml[:3000]:
+            queue.extend([l for l in locs if "product" in l.lower()] or locs)
+        else:
+            urls.extend(canonicalize(l) for l in locs
+                        if store.product_re.search(urlsplit(l).path))
+    if queue and files >= MAX_SITEMAP_FILES:
+        log.warning("[%s] stopped after %d sitemap files (list may be incomplete)",
+                    store.name, MAX_SITEMAP_FILES)
+    if not urls:
+        raise ExtractionError(f"no product URLs in the sitemaps ({last_error or 'none listed'})")
+    CACHE_DIR.mkdir(exist_ok=True)
+    cache.write_bytes(gzip.compress("\n".join(urls).encode("utf-8")))
+    return urls
+
+
+def sitemap_links(store: Store, query: Query) -> list:
+    """Rank sitemap URLs by how well their slug matches the query."""
+    ranked = []
+    for order, url in enumerate(load_store_urls(store)):
+        score = relevance(query, urlsplit(url).path)
+        if score is not None:
+            ranked.append((-score, order, url))
+    ranked.sort()
+    unique: dict = {}
+    for _, _, url in ranked:
+        unique.setdefault(product_id_for(url, store), url)
+    if not unique:
+        raise ExtractionError(f"no URL in the sitemap matches '{query.keywords}'")
+    return list(unique.values())
 
 
 # --------------------------------------------------------------------------- #
@@ -779,6 +910,10 @@ def init_db(db_path: str) -> sqlite3.Connection:
             last_seen    TEXT NOT NULL
         )
         """
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS store_health "
+        "(store TEXT PRIMARY KEY, failed_at TEXT NOT NULL, reason TEXT)"
     )
     conn.commit()
     return conn
@@ -819,6 +954,29 @@ def save_price(conn: sqlite3.Connection, product: Product, query_text: Optional[
          query_text, now, now),
     )
     conn.commit()
+
+
+HEALTH_TTL = 24 * 3600
+
+
+def record_failure(conn: sqlite3.Connection, store: str, reason: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO store_health VALUES (?, ?, ?)",
+                 (store, datetime.now().isoformat(timespec="seconds"), reason[:150]))
+    conn.commit()
+
+
+def clear_failure(conn: sqlite3.Connection, store: str) -> None:
+    conn.execute("DELETE FROM store_health WHERE store = ?", (store,))
+    conn.commit()
+
+
+def recent_failure(conn: sqlite3.Connection, store: str) -> Optional[str]:
+    """Reason if the store blocked us within the last 24h, else None."""
+    row = conn.execute("SELECT failed_at, reason FROM store_health WHERE store = ?",
+                       (store,)).fetchone()
+    if row and (datetime.now() - datetime.fromisoformat(row[0])).total_seconds() < HEALTH_TTL:
+        return row[1]
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -872,13 +1030,27 @@ def run_search(conn: sqlite3.Connection, query: Query, args) -> dict:
     status: dict = {}
     seen: set = set()
     for store in selected:
+        if not args.retry_blocked:
+            reason = recent_failure(conn, store.name)
+            if reason:
+                log.info("[%s] skipped: refused us within the last 24h. "
+                         "Use --retry-blocked to try again.", store.name)
+                status[store.name] = f"SKIPPED  blocked recently ({reason})"
+                continue
         try:
             products = search_store(store, query, args.max_per_store)
-        except Exception as exc:        # one broken/blocked retailer must not stop the rest
+        except FetchError as exc:       # blocked / unreachable: remember it, don't hammer the site
+            log.error("[%s] failed: %s", store.name, exc)
+            status[store.name] = f"FAILED   {exc}"
+            if "timed out" not in str(exc):
+                record_failure(conn, store.name, str(exc))
+            continue
+        except Exception as exc:        # one broken retailer must not stop the rest
             log.error("[%s] failed: %s", store.name, exc)
             log.debug("Details", exc_info=True)
             status[store.name] = f"FAILED   {exc}"
             continue
+        clear_failure(conn, store.name)
         count = 0
         for product in products:
             if product.product_id in seen:
@@ -888,6 +1060,21 @@ def run_search(conn: sqlite3.Connection, query: Query, args) -> dict:
             count += 1
         status[store.name] = f"OK       {count} product(s)"
     return status
+
+
+def check_stores() -> None:
+    """Report which stores permit automated search pages and publish sitemaps."""
+    CFG.respect_robots = True
+    for store in STORES:
+        base = _site_base(store)
+        search_ok = allowed_by_robots(store.search_url.format(q="test"))
+        parser = _ROBOTS.get(base)
+        if parser is None:
+            note = "robots.txt unreadable"
+        else:
+            maps = parser.site_maps()
+            note = f"{len(maps) if maps else 0} sitemap(s) listed"
+        print(f"  {store.name:<12} search pages: {'allowed' if search_ok else 'DISALLOWED':<10} {note}")
 
 
 def run_recheck(conn: sqlite3.Connection) -> dict:
@@ -982,6 +1169,8 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--search", help='Product to look for, e.g. "Sony WH-1000XM5"')
     mode.add_argument("--recheck", action="store_true", help="Re-scan all tracked products")
     mode.add_argument("--list", action="store_true", help="List tracked products")
+    mode.add_argument("--check-stores", action="store_true",
+                      help="Show which stores allow automated search (robots.txt)")
     mode.add_argument("--url", nargs="+", help="Track specific product page URL(s)")
     mode.add_argument("--name-selector", help="(with --url) optional CSS selector override")
     mode.add_argument("--price-selector", help="(with --url) optional CSS selector override")
@@ -995,6 +1184,10 @@ def parse_args() -> argparse.Namespace:
                      help="Max products to track per store (default 3)")
     opt.add_argument("--exclude", nargs="+", default=[],
                      help="Words that disqualify a result, e.g. --exclude fodral skal")
+    opt.add_argument("--min-price", type=float, help="Ignore results cheaper than this (SEK)")
+    opt.add_argument("--max-price", type=float, help="Ignore results dearer than this (SEK)")
+    opt.add_argument("--retry-blocked", action="store_true",
+                     help="Also retry stores that refused us within the last 24h")
     opt.add_argument("--db", default=DEFAULT_DB, help=f"SQLite file (default {DEFAULT_DB})")
     opt.add_argument("--js", choices=["auto", "always", "never"], default="auto",
                      help="Playwright usage: auto = only as fallback (default)")
@@ -1008,11 +1201,11 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
 
     # Interactive fallback: no mode given and we are in a terminal -> ask.
-    if not (args.search or args.recheck or args.list or args.url):
+    if not (args.search or args.recheck or args.list or args.url or args.check_stores):
         if sys.stdin.isatty():
             args.search = input("Search for a product: ").strip()
         if not args.search:
-            p.error("give one of --search, --recheck, --list or --url")
+            p.error("give one of --search, --recheck, --list, --url or --check-stores")
     return args
 
 
@@ -1031,6 +1224,10 @@ def main() -> int:
         log.error("--js always needs Playwright: pip install playwright && playwright install chromium")
         return 1
 
+    if args.check_stores:
+        check_stores()
+        return 0
+
     try:
         conn = init_db(args.db)
     except sqlite3.Error as exc:
@@ -1047,7 +1244,7 @@ def main() -> int:
             ok = print_summary(run_single_url(conn, args))
         else:
             try:
-                query = parse_query(args.search, args.exclude)
+                query = parse_query(args.search, args.exclude, args.min_price, args.max_price)
             except ValueError as exc:
                 log.error("%s", exc)
                 return 1
