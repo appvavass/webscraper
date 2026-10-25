@@ -16,11 +16,9 @@ Webhallen - https://www.webhallen.com/se # electronics
 
 Inet - https://www.inet.se # electronics
 
-MediaMarkt - https://www.mediamarkt.se # electronics
-
 Kjell - https://www.kjell.com/se # electronics
 
-
+https://www.power.se # electronics
 
 # --- Design & Furniture ---
 
@@ -35,6 +33,8 @@ Royal Design - https://royaldesign.se # design, furniture
 Rum21 - https://www.rum21.se # design, furniture
 
 Vålamagasinet - https://www.valamagasinet.se # design, furniture
+
+Designtorget - https://designtorget.se/ # design, furniture
 
 
 
