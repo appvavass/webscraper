@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from .extraction import scrape_product
@@ -40,6 +40,81 @@ def init_db(db_path: str) -> sqlite3.Connection:
     )
     conn.commit()
     return conn
+
+
+def get_daily_summary(conn: sqlite3.Connection, now: Optional[datetime] = None) -> list[dict]:
+    current_time = now or datetime.now()
+    if current_time.tzinfo is not None:
+        current_time = current_time.astimezone().replace(tzinfo=None)
+    cutoff = (current_time - timedelta(hours=24)).isoformat(timespec="seconds")
+    rows = conn.execute(
+        """
+        SELECT product_id, url, product_name, store, price, scanned_at
+          FROM price_history
+         WHERE scanned_at >= ?
+         ORDER BY scanned_at, id
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    summary: dict[str, dict] = {}
+    for product_id, url, name, store, price, scanned_at in rows:
+        key = product_id or url
+        product = summary.get(key)
+        if product is None:
+            product = {
+                "product_id": product_id,
+                "url": url,
+                "name": name or url,
+                "store": store or "Unknown store",
+                "observations": 0,
+                "first_price": price,
+                "latest_price": price,
+                "lowest_price": price,
+                "highest_price": price,
+                "first_seen": scanned_at,
+                "latest_seen": scanned_at,
+            }
+            summary[key] = product
+
+        product["observations"] += 1
+        product["latest_price"] = price
+        product["latest_seen"] = scanned_at
+        product["lowest_price"] = min(product["lowest_price"], price)
+        product["highest_price"] = max(product["highest_price"], price)
+
+    return sorted(summary.values(), key=lambda item: (item["store"].casefold(), item["name"].casefold()))
+
+
+def format_daily_report(products: list[dict]) -> str:
+    observation_count = sum(product["observations"] for product in products)
+    lines = [
+        "Price monitor — last 24 hours",
+        f"{observation_count} price observations across {len(products)} products.",
+    ]
+    if not products:
+        lines.append("No price data was collected in this period.")
+        return "\n".join(lines)
+
+    for product in products:
+        movement = ""
+        if product["latest_price"] < product["first_price"]:
+            movement = " ↓"
+        elif product["latest_price"] > product["first_price"]:
+            movement = " ↑"
+        lines.extend(
+            [
+                "",
+                f"{product['store']} — {product['name']}",
+                (
+                    f"{fmt_sek(product['first_price'])} → {fmt_sek(product['latest_price'])}"
+                    f"{movement} | low {fmt_sek(product['lowest_price'])}"
+                    f" | {product['observations']} check(s)"
+                ),
+                product["url"],
+            ]
+        )
+    return "\n".join(lines)
 
 
 def get_previous_and_lowest(conn: sqlite3.Connection, product: Product):

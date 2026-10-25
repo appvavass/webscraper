@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Price Monitor</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('index') }}"><span class="brand-mark">P</span> Price Monitor</a>
+    <span class="muted">Your tracked prices, at a glance</span>
+  </header>
+  <main class="container">
+    <section class="intro">
+      <div>
+        <p class="eyebrow">PRICE TRACKING DASHBOARD</p>
+        <h1>Your products</h1>
+        <p class="muted">Browse tracked products and review their price history.</p>
+      </div>
+      <div class="period-pill"><span class="status-dot"></span> Last 24 hours</div>
+    </section>
+
+    <section class="stats" aria-label="Recent activity">
+      <article class="stat-card"><span>Tracked products</span><strong>{{ products|length }}</strong></article>
+      <article class="stat-card"><span>Price checks</span><strong>{{ recent_observations }}</strong></article>
+      <article class="stat-card"><span>Products checked</span><strong>{{ recent_products }}</strong></article>
+    </section>
+
+    <section class="panel">
+      <form class="filters" method="get">
+        <label class="search-field">
+          <span class="sr-only">Search products</span>
+          <input type="search" name="q" value="{{ query }}" placeholder="Search products or URLs">
+        </label>
+        <label>
+          <span class="sr-only">Filter by store</span>
+          <select name="store">
+            <option value="">All stores</option>
+            {% for store_name in stores %}
+            <option value="{{ store_name }}" {% if selected_store == store_name %}selected{% endif %}>{{ store_name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <button type="submit">Filter</button>
+        {% if query or selected_store %}<a class="reset-link" href="{{ url_for('index') }}">Reset</a>{% endif %}
+      </form>
+
+      {% if products %}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Product</th><th>Store</th><th>Latest</th><th>Lowest</th><th>Checks</th><th>Last check</th><th></th></tr></thead>
+          <tbody>
+            {% for product in products %}
+            <tr>
+              <td><a class="product-link" href="{{ url_for('product_detail', product_id=product['product_id']) }}">{{ product["name"] or "Unnamed product" }}</a></td>
+              <td><span class="store-tag">{{ product["store"] or "Unknown" }}</span></td>
+              <td class="price">{% if product["latest_price"] is not none %}{{ "%.2f"|format(product["latest_price"]) }} kr{% else %}—{% endif %}</td>
+              <td class="muted">{% if product["lowest_price"] is not none %}{{ "%.2f"|format(product["lowest_price"]) }} kr{% else %}—{% endif %}</td>
+              <td class="muted">{{ product["observation_count"] }}</td>
+              <td class="muted">{{ (product["latest_seen"] or "—")|replace("T", " ") }}</td>
+              <td><a class="arrow-link" href="{{ url_for('product_detail', product_id=product['product_id']) }}" aria-label="View price history">→</a></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="empty-state">
+        <span class="empty-icon">↗</span>
+        <h2>{% if query or selected_store %}No matching products{% else %}No tracked products yet{% endif %}</h2>
+        <p class="muted">{% if query or selected_store %}Try changing or clearing your filters.{% else %}Run a search with <code>pricemonitor.py --search "product name"</code> to start collecting prices.{% endif %}</p>
+      </div>
+      {% endif %}
+    </section>
+    <footer>Price data is stored locally in your SQLite database.</footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ product["name"] or "Product" }} · Price Monitor</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('index') }}"><span class="brand-mark">P</span> Price Monitor</a>
+    <a class="back-link" href="{{ url_for('index') }}">← All products</a>
+  </header>
+  <main class="container detail-container">
+    <p class="eyebrow">{{ product["store"] or "Unknown store" }}</p>
+    <h1>{{ product["name"] or "Unnamed product" }}</h1>
+    <a class="external-link" href="{{ product['url'] }}" target="_blank" rel="noopener noreferrer">Open product page ↗</a>
+
+    <section class="panel history-panel">
+      <div class="panel-heading">
+        <div><h2>Price history</h2><p class="muted">{{ history|length }} recorded checks</p></div>
+        {% if history %}<div class="current-price">{{ "%.2f"|format(history[0]["price"]) }} <small>kr</small></div>{% endif %}
+      </div>
+      {% if history %}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Date and time</th><th>Price</th></tr></thead>
+          <tbody>
+            {% for item in history %}
+            <tr><td class="muted">{{ item["scanned_at"] }}</td><td class="price">{{ "%.2f"|format(item["price"]) }} kr</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="empty-state"><p class="muted">No price history has been recorded for this product.</p></div>
+      {% endif %}
+    </section>
+  </main>
+</body>
+</html>

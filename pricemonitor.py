@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Command-line entry point for the Swedish price monitor.
 
-Run ``python pricemonitor.py --search "product name"``. The implementation
-lives in ``price_monitor`` modules. Playwright can retry recoverable fetch
-failures, but never overrides a robots.txt denial or an explicit site block.
+Run ``python pricemonitor.py --search "product name"`` to search, ``--web`` to
+open the local database dashboard, or ``--daily`` to recheck tracked items and
+send a Telegram summary. The implementation lives in ``price_monitor`` modules.
+Playwright can retry recoverable fetch failures, but never overrides a
+robots.txt denial or an explicit site block.
 
-Install core dependencies with ``pip install requests beautifulsoup4``.
-For JavaScript-rendered pages, install Playwright and Chromium separately.
+Install dependencies with ``pip install -r requirements.txt``. For
+JavaScript-rendered pages, install Playwright and Chromium separately.
 """
 
 import sys

@@ -86,7 +86,7 @@ def prompt_user_for_input(all_stores: list[Store], base_args: argparse.Namespace
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Search Swedish web shops by category and track product prices.",
+        description="Search Swedish web shops, track prices, and view or report on the database.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     mode = p.add_argument_group("what to do")
@@ -96,6 +96,9 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--list", action="store_true", help="List tracked products")
     mode.add_argument("--check-stores", action="store_true", help="Check robots.txt status")
     mode.add_argument("--url", nargs="+", help="Track specific product page URLs")
+    mode.add_argument("--web", action="store_true", help="Start the local database dashboard")
+    mode.add_argument("--send-daily-report", action="store_true", help="Send the last 24 hours of prices to Telegram")
+    mode.add_argument("--daily", action="store_true", help="Recheck tracked prices, then send a Telegram report")
 
     opt = p.add_argument_group("options")
     default_stores = Path(__file__).resolve().parent.parent / "stores.txt"
@@ -108,6 +111,8 @@ def parse_args() -> argparse.Namespace:
     opt.add_argument("--max-price", type=float, help="Maximum price limit in SEK")
     opt.add_argument("--retry-blocked", action="store_true", help="Retry blocked stores")
     opt.add_argument("--db", default=DEFAULT_DB, help=f"SQLite file path (default: {DEFAULT_DB})")
+    opt.add_argument("--host", default="127.0.0.1", help="Dashboard address (default: 127.0.0.1)")
+    opt.add_argument("--port", type=int, default=5000, help="Dashboard port (default: 5000)")
     opt.add_argument("--js", choices=["auto", "always", "never"], default="auto", help="Playwright usage mode")
     opt.add_argument("--delay", type=float, default=1.5, help="Average pause between requests (default: 1.5s)")
     opt.add_argument("--ignore-robots", action="store_true", help="Bypass robots.txt")
@@ -132,6 +137,31 @@ def main() -> int:
     if args.refresh_cache and CACHE_DIR.exists():
         shutil.rmtree(CACHE_DIR, ignore_errors=True)
         log.info("Cache cleared.")
+
+    if args.web:
+        from .web import create_app
+
+        create_app(args.db).run(host=args.host, port=args.port, debug=False)
+        return 0
+
+    if args.send_daily_report or args.daily:
+        from .notifications import NotificationError, load_dotenv, send_daily_report
+
+        env_path = Path(__file__).resolve().parent.parent / ".env"
+        try:
+            load_dotenv(env_path)
+            conn = init_db(args.db)
+            try:
+                if args.daily:
+                    run_recheck(conn)
+                character_count = send_daily_report(conn)
+            finally:
+                conn.close()
+        except (NotificationError, ValueError, OSError) as exc:
+            log.error("Daily report failed: %s", exc)
+            return 1
+        log.info("Daily report sent to Telegram (%d characters).", character_count)
+        return 0
 
     STORES[:] = load_stores(Path(args.stores_file))
     if not STORES:
