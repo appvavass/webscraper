@@ -2,20 +2,37 @@
 """
 price_monitor.py - Search Swedish web shops by category and track product prices.
 
-Usage
------
-    Stores are read from stores.txt (next to this script), with optional category tags:
-        NetOnNet - https://www.netonnet.se # electronics
-        Nordiska Galleriet - https://www.nordiskagalleriet.se # design, furniture
+Usage & Flags Overview
+----------------------
+Search & Filtering:
+    --search "Text"         Product to look for (e.g. "Samsung Frame" or "Lilla Åland")
+    --category CAT [CAT...] Filter by category (electronics, design, furniture, auction, general)
+    --exclude WORD [WORD...] Exclude results containing these words (e.g. --exclude skal fodral)
+    --min-price SEK         Ignore items cheaper than this amount
+    --max-price SEK         Ignore items more expensive than this amount
+    --max-per-store N       Maximum accepted items to collect per store (default: 10)
 
-    # Interactive prompt (asks for product name and category selection):
-    python price_monitor.py
+Operation Modes:
+    --recheck               Re-scan all tracked products (fast, directly by URL)
+    --list                  List all currently tracked products and lowest recorded prices
+    --check-stores          Check which stores permit search pages (via robots.txt)
+    --url URL [URL...]      Track specific product page URLs directly
 
-    # Search with category filter via CLI:
-    python price_monitor.py --search "Samsung Frame" --category design electronics
+Advanced Options:
+    --stores-file FILE      Custom stores file (default: stores.txt)
+    --stores STORE [STORE...] Restrict search to specific shop names from stores.txt
+    --js auto|always|never  Headless browser mode (Playwright required for 'always' or fallback)
+    --delay SECONDS         Average pause between HTTP requests (default: 1.5s)
+    --ignore-robots         Bypass robots.txt restrictions
+    --retry-blocked         Retry stores that refused connection in the last 24h
+    --refresh-cache         Clear cached search URLs and sitemap indexes
+    --dump-html DIR         Save fetched raw/JS HTML to directory for debugging
+    -v, --verbose           Enable debug logging
 
-    # Re-check tracked items:
-    python price_monitor.py --recheck
+Install Dependencies
+--------------------
+    pip install requests beautifulsoup4
+    pip install playwright && playwright install chromium     # optional, for JS-only pages
 """
 
 from __future__ import annotations
@@ -47,7 +64,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # --------------------------------------------------------------------------- #
-# Configuration
+# Configuration & Settings
 # --------------------------------------------------------------------------- #
 
 DEFAULT_DB = "price_history.db"
@@ -64,7 +81,7 @@ HEADERS = {
 
 @dataclass
 class Settings:
-    """Runtime settings."""
+    """Runtime configuration settings."""
     timeout: int = 20
     delay: float = 1.5
     js_mode: str = "auto"              # auto | always | never
@@ -96,6 +113,7 @@ class Store:
     key: str = ""
 
 
+# Tuned configurations for pre-defined shops
 KNOWN = {
     "elgiganten.se": dict(
         key="Elgiganten",
@@ -154,7 +172,7 @@ KNOWN = {
 
 STORES: list[Store] = []
 
-DEFAULT_STORES_TXT = """# Swedish stores by category - Name - Home URL [- Search URL] [# category1, category2]
+DEFAULT_STORES_TXT = """# Stores list - Name - Home URL [- Search URL] [# category1, category2]
 Elgiganten - https://www.elgiganten.se # electronics
 NetOnNet - https://www.netonnet.se # electronics
 Webhallen - https://www.webhallen.com/se # electronics
@@ -242,7 +260,7 @@ def parse_store_line(line: str):
 def load_stores(path: Path) -> list[Store]:
     if not path.exists():
         path.write_text(DEFAULT_STORES_TXT, encoding="utf-8")
-        log.info("Created %s with default stores list.", path)
+        log.info("Created %s with default store configurations.", path)
     stores: list[Store] = []
     seen: set = set()
     for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
@@ -274,16 +292,16 @@ def store_for_url(url: str) -> Optional[Store]:
 # --------------------------------------------------------------------------- #
 
 class FetchError(Exception):
-    """Page could not be downloaded."""
+    """Page download error."""
 
 class RobotsDisallowed(FetchError):
-    """robots.txt forbids fetching this URL."""
+    """Disallowed by robots.txt."""
 
 class ExtractionError(Exception):
-    """Page loaded but required data missing."""
+    """Data extraction error."""
 
 class PriceParseError(Exception):
-    """Price string conversion failed."""
+    """Price string parsing error."""
 
 @dataclass
 class Product:
@@ -296,7 +314,7 @@ class Product:
 
 
 # --------------------------------------------------------------------------- #
-# Query & Relevance Engine
+# Query Engine & Relevance Evaluation
 # --------------------------------------------------------------------------- #
 
 _ALNUM = "0-9a-zåäöé"
@@ -352,7 +370,7 @@ def relevance(query: Query, *texts: str, min_score: float = 0.5) -> Optional[flo
 
 
 # --------------------------------------------------------------------------- #
-# Price Parsing
+# Price Formatting & Conversion
 # --------------------------------------------------------------------------- #
 
 _PRICE_RE = re.compile(r"\d{1,3}(?:[ .]\d{3})+(?:[,.]\d{1,2})?|\d+(?:[,.]\d{1,2})?")
@@ -372,7 +390,7 @@ def clean_swedish_price(raw: str) -> float:
     try:
         return float(number)
     except ValueError as exc:
-        raise PriceParseError(f"Could not convert {number!r} to float") from exc
+        raise PriceParseError(f"Could not convert {number!r} to numeric float") from exc
 
 
 def _to_number(value) -> Optional[float]:
@@ -390,8 +408,16 @@ def _to_number(value) -> Optional[float]:
     return number if number > 0 else None
 
 
+def fmt_sek(value: float) -> str:
+    if float(value).is_integer():
+        formatted = f"{int(value):,}".replace(",", " ")
+    else:
+        formatted = f"{value:,.2f}".replace(",", " ").replace(".", ",")
+    return f"{formatted} kr"
+
+
 # --------------------------------------------------------------------------- #
-# Web Fetcher & Robots.txt Engine
+# Web Fetcher & Browser Engines
 # --------------------------------------------------------------------------- #
 
 def _build_session() -> requests.Session:
@@ -550,7 +576,7 @@ def fetch_and_extract(url: str, extractor: Callable[[str], object]):
 
 
 # --------------------------------------------------------------------------- #
-# Product Page Extraction
+# Product Data Extraction
 # --------------------------------------------------------------------------- #
 
 PRICE_CSS_PATTERNS = [
@@ -716,10 +742,9 @@ def scrape_product(url: str, store_name: str, query: Optional[Query] = None,
 
 
 # --------------------------------------------------------------------------- #
-# Store Search & Sitemap Fallback Engine
+# Search & Sitemap Discovery Engine
 # --------------------------------------------------------------------------- #
 
-_MONEY_RE = re.compile(r"\d[\d\s\u00a0.,]*\s?(?:kr|:-|sek)\b", re.I)
 _ASSET_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|svg|pdf|xml|css|js|ico)$", re.I)
 CACHE_DIR = Path(".price_monitor_cache")
 SITEMAP_TTL = 7 * 24 * 3600
@@ -817,7 +842,6 @@ def sitemap_links(store: Store, query: Query) -> list:
 
 
 def search_store(store: Store, query: Query, max_results: int) -> list:
-    source = "search page"
     try:
         if not store.search_url:
             raise ExtractionError("No search URL configured")
@@ -829,7 +853,6 @@ def search_store(store: Store, query: Query, max_results: int) -> list:
         log.info("[%s] Search failed (%s) - attempting sitemap discovery fallback", store.name, exc)
         try:
             links = sitemap_links(store, query)
-            source = "sitemap"
         except Exception as exc2:
             raise ExtractionError(f"search: {exc}; sitemap: {exc2}") from exc2
 
@@ -848,7 +871,7 @@ def search_store(store: Store, query: Query, max_results: int) -> list:
 
 
 # --------------------------------------------------------------------------- #
-# Database & Tracking Engine
+# Database Management & Reporting
 # --------------------------------------------------------------------------- #
 
 def init_db(db_path: str) -> sqlite3.Connection:
@@ -883,6 +906,14 @@ def init_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def get_previous_and_lowest(conn: sqlite3.Connection, product: Product):
+    where = "product_id = ? OR url = ?"
+    args = (product.product_id, product.url)
+    prev = conn.execute(f"SELECT price FROM price_history WHERE {where} ORDER BY id DESC LIMIT 1", args).fetchone()
+    low = conn.execute(f"SELECT MIN(price) FROM price_history WHERE {where}", args).fetchone()
+    return (prev[0] if prev else None), (low[0] if low else None)
+
+
 def save_price(conn: sqlite3.Connection, product: Product, query_text: Optional[str]) -> None:
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
@@ -901,21 +932,121 @@ def save_price(conn: sqlite3.Connection, product: Product, query_text: Optional[
     conn.commit()
 
 
+def report_price_change(p: Product, previous: Optional[float], lowest: Optional[float]) -> None:
+    tag = f"[{p.store}] {p.name}"
+    if previous is None:
+        print(f"ℹ️  New product tracked: {tag}\n   {fmt_sek(p.price)} (baseline saved)\n   {p.url}")
+    elif p.price < previous:
+        diff = previous - p.price
+        extra = "\n   ⭐ Lowest price recorded so far!" if lowest is not None and p.price <= lowest else ""
+        print(f"🔻 PRICE DROP! {tag}\n   {fmt_sek(previous)} -> {fmt_sek(p.price)} (-{fmt_sek(diff)}){extra}\n   {p.url}")
+    elif p.price > previous:
+        diff = p.price - previous
+        print(f"🔺 Price increase: {tag}\n   {fmt_sek(previous)} -> {fmt_sek(p.price)} (+{fmt_sek(diff)})\n   {p.url}")
+    else:
+        print(f"➖ No change: {tag} - {fmt_sek(p.price)}\n   {p.url}")
+
+
 def handle_product(conn: sqlite3.Connection, product: Product, query_text: Optional[str]) -> None:
+    previous, lowest = get_previous_and_lowest(conn, product)
+    report_price_change(product, previous, lowest)
     save_price(conn, product, query_text)
-    print(f"[{product.store}] {product.name} - {product.price:g} SEK\n   {product.url}")
+
+
+def list_tracked(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT t.store, t.name, t.url,
+               (SELECT price FROM price_history h WHERE h.product_id = t.product_id ORDER BY h.id DESC LIMIT 1),
+               (SELECT MIN(price) FROM price_history h WHERE h.product_id = t.product_id)
+          FROM tracked_products t ORDER BY t.store, t.name
+        """
+    ).fetchall()
+    if not rows:
+        print("Nothing tracked yet.")
+        return
+    for store, name, url, last, low in rows:
+        print(f"[{store}] {name}\n   now {fmt_sek(last)} | lowest {fmt_sek(low)}\n   {url}")
+
+
+def run_recheck(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT product_id, url, store, search_query FROM tracked_products").fetchall()
+    if not rows:
+        print("Nothing tracked yet to recheck.")
+        return
+    for pid, url, store_name, query_text in rows:
+        try:
+            product = scrape_product(url, store_name)
+            product.product_id = pid
+            handle_product(conn, product, query_text)
+        except Exception as exc:
+            log.error("[%s] %s: %s", store_name, url, exc)
+
+
+def check_stores() -> None:
+    for store in STORES:
+        base = f"https://{store.domain}"
+        allowed_by_robots(base + "/")
+        parser = _ROBOTS.get(base)
+        maps = parser.site_maps() if parser else None
+        print(f"  {store.name:<18} sitemaps: {len(maps) if maps else 0}")
 
 
 # --------------------------------------------------------------------------- #
-# CLI & Interactive Wizard
+# CLI Parser & Interactive Prompt
 # --------------------------------------------------------------------------- #
 
-def prompt_user_for_input(all_stores: list[Store]) -> tuple[str, list[str]]:
-    query_text = input("Enter product to search for: ").strip()
-    if not query_text:
+def print_flag_reminder():
+    print("\n" + "=" * 65)
+    print("💡 HELPER FLAGS REMINDER (Pass these via command-line):")
+    print("  --category CAT [CAT...] : Filter shops (electronics, design, furniture, auction, general)")
+    print("  --exclude WORD [WORD...] : Exclude items with specific words (e.g. --exclude skal fodral)")
+    print("  --min-price SEK          : Ignore items cheaper than SEK limit")
+    print("  --max-price SEK          : Ignore items pricier than SEK limit")
+    print("  --max-per-store N        : Max matching items per store (default: 10)")
+    print("  --js auto|always|never   : JavaScript engine mode")
+    print("  --delay SECONDS          : Pause between requests (default: 1.5s)")
+    print("  --ignore-robots          : Ignore robots.txt rules")
+    print("  --retry-blocked          : Retry shops that failed recently")
+    print("  --dump-html DIR          : Dump raw HTML for debugging")
+    print("  -v, --verbose            : Turn on verbose log messages")
+    print("=" * 65 + "\n")
+
+
+import shlex
+
+
+def prompt_user_for_input(all_stores: list[Store], base_args: argparse.Namespace) -> tuple[str, list[str]]:
+    print_flag_reminder()
+    raw_input = input("Enter product to search for (you can include flags like --min-price 1200): ").strip()
+    if not raw_input:
         print("Search text cannot be empty.")
         sys.exit(1)
 
+    # Re-parse input string to extract embedded flags (--min-price, --exclude, etc.)
+    tokens = shlex.split(raw_input)
+    sub_parser = argparse.ArgumentParser(add_help=False)
+    sub_parser.add_argument("--exclude", nargs="+", default=[])
+    sub_parser.add_argument("--min-price", type=float)
+    sub_parser.add_argument("--max-price", type=float)
+    sub_parser.add_argument("--max-per-store", type=int)
+
+    extra_args, remaining_tokens = sub_parser.parse_known_args(tokens)
+
+    # Update base args with any flags parsed from the prompt string
+    if extra_args.min_price is not None:
+        base_args.min_price = extra_args.min_price
+    if extra_args.max_price is not None:
+        base_args.max_price = extra_args.max_price
+    if extra_args.exclude:
+        base_args.exclude.extend(extra_args.exclude)
+    if extra_args.max_per_store is not None:
+        base_args.max_per_store = extra_args.max_per_store
+
+    # Clean search query text without the flags
+    search_text = " ".join(remaining_tokens)
+
+    # Category selection prompt
     categories_set = set()
     for store in all_stores:
         categories_set.update(store.categories)
@@ -936,42 +1067,106 @@ def prompt_user_for_input(all_stores: list[Store]) -> tuple[str, list[str]]:
             if 1 <= idx <= len(sorted_categories):
                 selected_cats.append(sorted_categories[idx - 1])
 
-    return query_text, selected_cats
+    return search_text, selected_cats
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Search Swedish web shops by category and track product prices.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    mode = p.add_argument_group("what to do")
+    mode.add_argument("--search", help='Product to look for, e.g. "Sony WH-1000XM5"')
+    mode.add_argument("--category", "--categories", nargs="+", help="Filter stores by category (e.g. design furniture)")
+    mode.add_argument("--recheck", action="store_true", help="Re-scan all tracked products")
+    mode.add_argument("--list", action="store_true", help="List tracked products")
+    mode.add_argument("--check-stores", action="store_true", help="Check robots.txt status")
+    mode.add_argument("--url", nargs="+", help="Track specific product page URLs")
+
+    opt = p.add_argument_group("options")
+    opt.add_argument("--stores-file", default=str(Path(__file__).with_name("stores.txt")), help="Stores file")
+    opt.add_argument("--stores", nargs="+", type=str.lower, help="Only search specific stores by name")
+    opt.add_argument("--max-per-store", type=int, default=10, help="Products per store (default: 10)")
+    opt.add_argument("--refresh-cache", action="store_true", help="Clear sitemap/URL cache")
+    opt.add_argument("--exclude", nargs="+", default=[], help="Disqualifying words (e.g. --exclude skal fodral)")
+    opt.add_argument("--min-price", type=float, help="Minimum price limit in SEK")
+    opt.add_argument("--max-price", type=float, help="Maximum price limit in SEK")
+    opt.add_argument("--retry-blocked", action="store_true", help="Retry blocked stores")
+    opt.add_argument("--db", default=DEFAULT_DB, help=f"SQLite file path (default: {DEFAULT_DB})")
+    opt.add_argument("--js", choices=["auto", "always", "never"], default="auto", help="Playwright usage mode")
+    opt.add_argument("--delay", type=float, default=1.5, help="Average pause between requests (default: 1.5s)")
+    opt.add_argument("--ignore-robots", action="store_true", help="Bypass robots.txt")
+    opt.add_argument("--dump-html", metavar="DIR", help="Save fetched HTML for debugging")
+    opt.add_argument("-v", "--verbose", action="store_true", help="Verbose log output")
+    return p.parse_args()
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Search Swedish stores by category and track prices.")
-    p.add_argument("--search", help="Product to search for")
-    p.add_argument("--category", "--categories", nargs="+", help="Category filter(s), e.g. design furniture")
-    p.add_argument("--stores-file", default=str(Path(__file__).with_name("stores.txt")))
-    p.add_argument("--recheck", action="store_true", help="Re-scan tracked items")
-    p.add_argument("--db", default=DEFAULT_DB)
-    args = p.parse_args()
+    args = parse_args()
+
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
+
+    CFG.js_mode = args.js
+    CFG.delay = max(0.0, args.delay)
+    CFG.respect_robots = not args.ignore_robots
+    if args.dump_html:
+        CFG.dump_dir = Path(args.dump_html)
+        CFG.dump_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.refresh_cache and CACHE_DIR.exists():
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+        log.info("Cache cleared.")
 
     STORES[:] = load_stores(Path(args.stores_file))
     if not STORES:
         log.error("No stores loaded from %s", args.stores_file)
         return 1
 
+    if args.check_stores:
+        check_stores()
+        return 0
+
     conn = init_db(args.db)
 
+    if args.list:
+        list_tracked(conn)
+        return 0
+
     if args.recheck:
-        log.info("Running recheck...")
+        run_recheck(conn)
+        return 0
+
+    if args.url:
+        for u in args.url:
+            st = store_for_url(u)
+            name = st.name if st else urlsplit(u).netloc
+            try:
+                prod = scrape_product(u, name)
+                handle_product(conn, prod, None)
+            except Exception as exc:
+                log.error("[%s] Failed to fetch %s: %s", name, u, exc)
         return 0
 
     search_text = args.search
     selected_categories = [c.lower() for c in (args.category or [])]
 
     if not search_text and sys.stdin.isatty():
-        search_text, selected_categories = prompt_user_for_input(STORES)
-
+        search_text, selected_categories = prompt_user_for_input(STORES, args)
+        
     if not search_text:
-        p.error("Provide --search or use interactive mode.")
+        log.error("Please provide a search query or use interactive mode.")
+        return 1
 
-    query = parse_query(search_text)
+    try:
+        query = parse_query(search_text, args.exclude, args.min_price, args.max_price)
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 1
 
     active_stores = STORES
-    if selected_categories:
+    if args.stores:
+        active_stores = [s for s in STORES if s.name.lower() in args.stores]
+    elif selected_categories:
         active_stores = [
             s for s in STORES
             if any(cat in s.categories for cat in selected_categories)
@@ -980,7 +1175,7 @@ def main() -> int:
 
     for store in active_stores:
         try:
-            products = search_store(store, query, max_results=3)
+            products = search_store(store, query, max_results=args.max_per_store)
             for product in products:
                 handle_product(conn, product, query.raw)
         except Exception as exc:
