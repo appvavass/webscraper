@@ -1,51 +1,21 @@
 #!/usr/bin/env python3
 """
-price_monitor.py - Search Swedish web shops for a product and track its price.
+price_monitor.py - Search Swedish web shops by category and track product prices.
 
 Usage
 -----
-    Stores are read from stores.txt (next to this script), one per line:
-        NetOnNet - https://www.netonnet.se
-    The file is created with sensible defaults on the first run.
+    Stores are read from stores.txt (next to this script), with optional category tags:
+        NetOnNet - https://www.netonnet.se # electronics
+        Nordiska Galleriet - https://www.nordiskagalleriet.se # design, furniture
 
-    # Search several stores, pick the best matches, record prices, report drops
-    python price_monitor.py --search "Sony WH-1000XM5"
+    # Interactive prompt (asks for product name and category selection):
+    python price_monitor.py
 
-    # Re-check everything you are already tracking (cheap: no searching) - good for cron
+    # Search with category filter via CLI:
+    python price_monitor.py --search "Samsung Frame" --category design electronics
+
+    # Re-check tracked items:
     python price_monitor.py --recheck
-
-    # List what is tracked, with the latest price
-    python price_monitor.py --list
-
-    # Which stores permit automated search pages? (reads each store's robots.txt)
-    python price_monitor.py --check-stores
-
-    # Track specific product pages (selectors are auto-detected) - then use --recheck
-    python price_monitor.py --url "https://www.example.se/produkt/123" "https://www.example.se/produkt/456"
-
-    # Useful options
-    python price_monitor.py --search "iPhone 15 128GB" --exclude fodral skal \
-        --stores elgiganten webhallen --max-per-store 2 --js never -v
-
-How it works
-------------
-1. The query is cleaned and split into tokens.  Tokens containing digits
-   (model numbers such as "wh-1000xm5") MUST appear in a result to count as a match.
-2. Each store's search page is fetched and product links are collected from
-   <a> tags AND from JSON embedded in the page (works for Next.js-style sites).
-   If a store's robots.txt forbids its search page, the store's own published
-   sitemap is used to find matching product pages instead (cached for 7 days).
-3. The best-matching product pages are fetched and parsed WITHOUT per-store CSS
-   selectors, using, in order: JSON-LD (schema.org Product), microdata
-   (itemprop="price"), OpenGraph/product meta tags, and common price CSS patterns.
-4. Every product gets a stable ID, is stored in SQLite with a timestamp, and is
-   compared with its previous price.
-5. Any store that fails or blocks us is logged and skipped - the others continue.
-
-Install
--------
-    pip install requests beautifulsoup4
-    pip install playwright && playwright install chromium     # optional, for JS-only pages
 """
 
 from __future__ import annotations
@@ -64,7 +34,7 @@ import sqlite3
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -94,12 +64,12 @@ HEADERS = {
 
 @dataclass
 class Settings:
-    """Runtime settings, filled in from the command line in main()."""
+    """Runtime settings."""
     timeout: int = 20
-    delay: float = 1.5                 # average pause between requests (seconds)
+    delay: float = 1.5
     js_mode: str = "auto"              # auto | always | never
     respect_robots: bool = True
-    dump_dir: Optional[Path] = None    # save fetched HTML here for debugging
+    dump_dir: Optional[Path] = None
 
 
 CFG = Settings()
@@ -111,37 +81,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("price_monitor")
 
-
-# --------------------------------------------------------------------------- #
-# Store definitions (loaded from stores.txt)
-# --------------------------------------------------------------------------- #
-# stores.txt lists one shop per line:      Name - home URL
-# Optional third part if the search page cannot be detected automatically:
-#                                          Name - home URL - https://shop.se/sok?q={q}
-# Blank lines and lines starting with # are ignored.
-#
-# For shops this script knows (KNOWN below) the tuned settings are used.
-# For any other shop it detects the search form on the home page and finds
-# product links on the result page by looking for links that sit next to a price;
-# every candidate page is then verified by reading its price/name (see
-# extract_product_data), so no per-store CSS selectors are ever needed.
-
 _LINK = r"""[^\s"'<>\\?#]+"""
 
 
 @dataclass(frozen=True)
 class Store:
-    name: str                                   # label shown in output (from stores.txt)
-    domain: str                                 # e.g. "netonnet.se"
-    home: str                                   # home URL from stores.txt
-    search_url: Optional[str] = None            # template containing {q}; None = auto-detect
-    product_re: Optional["re.Pattern[str]"] = None   # None = generic detection
-    id_re: Optional["re.Pattern[str]"] = None   # group(1) = the shop's own product number
-    key: str = ""                               # stable name used when building product IDs
+    name: str
+    domain: str
+    home: str
+    categories: list[str] = field(default_factory=list)
+    search_url: Optional[str] = None
+    product_re: Optional["re.Pattern[str]"] = None
+    id_re: Optional["re.Pattern[str]"] = None
+    key: str = ""
 
 
-# Tuned settings for shops we know. "key" keeps product IDs stable even if you
-# rename the shop in stores.txt.
 KNOWN = {
     "elgiganten.se": dict(
         key="Elgiganten",
@@ -156,43 +110,68 @@ KNOWN = {
         search_url="https://www.webhallen.com/se/search?searchString={q}",
         product_re=re.compile(r"/se/product/\d+" + r"[^\s\"'<>\\?#]*"),
         id_re=re.compile(r"/product/(\d+)")),
-    "komplett.se": dict(
-        key="Komplett",
-        search_url="https://www.komplett.se/search?q={q}",
-        product_re=re.compile(r"/product/\d+" + r"[^\s\"'<>\\?#]*"),
-        id_re=re.compile(r"/product/(\d+)")),
     "inet.se": dict(
         key="Inet",
         search_url="https://www.inet.se/hitta?q={q}",
         product_re=re.compile(r"/produkt/\d+" + r"[^\s\"'<>\\?#]*"),
         id_re=re.compile(r"/produkt/(\d+)")),
-    "mediamarkt.se": dict(
-        key="MediaMarkt",
-        search_url="https://www.mediamarkt.se/sv/search.html?query={q}",
-        product_re=re.compile(r"/sv/product/" + _LINK),
-        id_re=re.compile(r"-(\d{5,})\.html$")),
     "kjell.com": dict(
         key="Kjell",
         search_url="https://www.kjell.com/se/sok?query={q}",
         product_re=re.compile(r"/se/[^\s\"'<>\\?#]*/p/\d+"),
         id_re=re.compile(r"/p/(\d+)")),
+    "svenssons.se": dict(
+        key="Svenssons",
+        search_url="https://www.svenssons.se/sok/?q={q}"),
+    "nordiskagalleriet.se": dict(
+        key="NordiskaGalleriet",
+        search_url="https://www.nordiskagalleriet.se/sok?q={q}"),
+    "lannamobler.se": dict(
+        key="LannaMobler",
+        search_url="https://www.lannamobler.se/sok?q={q}"),
+    "royaldesign.se": dict(
+        key="RoyalDesign",
+        search_url="https://royaldesign.se/sok?q={q}"),
+    "rum21.se": dict(
+        key="Rum21",
+        search_url="https://www.rum21.se/sok?q={q}"),
+    "valamagasinet.se": dict(
+        key="Valamagasinet",
+        search_url="https://www.valamagasinet.se/sok?q={q}"),
+    "ahlens.se": dict(
+        key="Ahlens",
+        search_url="https://www.ahlens.se/sok?q={q}"),
+    "auctionet.com": dict(
+        key="Auctionet",
+        search_url="https://auctionet.com/sv/search?is_auction=true&q={q}"),
+    "bukowskis.com": dict(
+        key="Bukowskis",
+        search_url="https://www.bukowskis.com/sv/lots/search?q={q}"),
+    "tradera.com": dict(
+        key="Tradera",
+        search_url="https://www.tradera.com/search?q={q}"),
 }
 
-STORES: list = []          # filled from stores.txt in main()
+STORES: list[Store] = []
 
-DEFAULT_STORES_TXT = """# Stores to search - one per line:   Name - home URL
-# Lines starting with # are ignored.
-# If a shop's search page cannot be detected automatically, add its search URL
-# (with {q} where the search words go) as a third part, e.g.
-#   Power - https://www.power.se - https://www.power.se/search/?q={q}
+DEFAULT_STORES_TXT = """# Swedish stores by category - Name - Home URL [- Search URL] [# category1, category2]
+Elgiganten - https://www.elgiganten.se # electronics
+NetOnNet - https://www.netonnet.se # electronics
+Webhallen - https://www.webhallen.com/se # electronics
+Inet - https://www.inet.se # electronics
+Kjell & Company - https://www.kjell.com/se # electronics
 
-Elgiganten - https://www.elgiganten.se
-NetOnNet - https://www.netonnet.se
-Webhallen - https://www.webhallen.com/se
-Inet - https://www.inet.se
-MediaMarkt - https://www.mediamarkt.se
-Kjell - https://www.kjell.com/se
-# Komplett - https://www.komplett.se     (reset our connections in testing)
+Svenssons - https://www.svenssons.se # design, furniture
+Nordiska Galleriet - https://www.nordiskagalleriet.se # design, furniture
+Länna Möbler - https://www.lannamobler.se # design, furniture
+Royal Design - https://royaldesign.se # design, furniture
+Rum21 - https://www.rum21.se # design, furniture
+Vålamagasinet - https://www.valamagasinet.se # design, furniture
+Åhléns - https://www.ahlens.se # general, design
+
+Auctionet - https://auctionet.com # auction, design
+Bukowskis - https://www.bukowskis.com # auction, design
+Tradera - https://www.tradera.com # auction, general
 """
 
 _URL_RE = re.compile(r"https?://\S+")
@@ -203,54 +182,76 @@ def _domain_of(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
-def make_store(name: str, home: str, search_template: Optional[str] = None) -> Store:
-    """Build a Store from a stores.txt entry, using tuned settings when the shop is known."""
+def make_store(name: str, home: str, search_template: Optional[str] = None, categories: Optional[list[str]] = None) -> Store:
     domain = _domain_of(home)
-    known = next((v for d, v in KNOWN.items() if domain.endswith(d)), {})
-    return Store(name=name, domain=domain, home=home,
-                 search_url=search_template or known.get("search_url"),
-                 product_re=known.get("product_re"), id_re=known.get("id_re"),
-                 key=known.get("key", domain))
+    known = None
+    for d, cfg in KNOWN.items():
+        if domain == d or domain.endswith("." + d):
+            known = cfg
+            break
+
+    if known:
+        search_url = search_template or known.get("search_url")
+        product_re = known.get("product_re")
+        id_re = known.get("id_re")
+        key = known.get("key", domain)
+    else:
+        search_url = search_template or f"https://{domain}/sok?q={{q}}"
+        product_re = None
+        id_re = None
+        key = domain
+
+    return Store(
+        name=name,
+        domain=domain,
+        home=home,
+        categories=[c.lower() for c in (categories or ["general"])],
+        search_url=search_url,
+        product_re=product_re,
+        id_re=id_re,
+        key=key,
+    )
 
 
 def parse_store_line(line: str):
-    """'Name - https://home[ - https://search?q={q}]' -> (name, home, template) or None."""
     line = line.strip()
     if not line or line.startswith("#"):
         return None
+
+    categories = []
+    if "#" in line:
+        line, comment_part = line.split("#", 1)
+        categories = [c.strip().lower() for c in comment_part.split(",") if c.strip()]
+
     urls = _URL_RE.findall(line)
-    if urls:
-        name_part = line[:line.index(urls[0])]
-    else:                                        # allow a bare domain: "NetOnNet - www.netonnet.se"
+    if not urls:
         m = re.search(r"(?:^|\s)((?:[\w-]+\.)+[a-z]{2,}(?:/\S*)?)\s*$", line, re.I)
         if not m:
-            raise ValueError("no URL found")
+            return None
         urls = ["https://" + m.group(1)]
         name_part = line[:m.start(1)]
+    else:
+        name_part = line[:line.index(urls[0])]
+
     home = urls[0].rstrip(",;")
     template = next((u.rstrip(",;") for u in urls[1:] if "{q}" in u), None)
     name = name_part.strip(" \t-\u2013\u2014:,|=").strip() or _domain_of(home).split(".")[0].capitalize()
-    return name, home, template
+    return name, home, template, categories
 
 
-def load_stores(path: Path) -> list:
-    """Read stores.txt (creating a default one if it does not exist)."""
+def load_stores(path: Path) -> list[Store]:
     if not path.exists():
         path.write_text(DEFAULT_STORES_TXT, encoding="utf-8")
-        log.info("Created %s with a default list of stores - edit it to add or remove shops.", path)
-    stores: list = []
+        log.info("Created %s with default stores list.", path)
+    stores: list[Store] = []
     seen: set = set()
     for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-        try:
-            parsed = parse_store_line(line)
-        except ValueError as exc:
-            log.warning("%s line %d ignored (%s): %s", path.name, number, exc, line.strip())
-            continue
+        parsed = parse_store_line(line)
         if not parsed:
             continue
-        store = make_store(*parsed)
+        name, home, template, categories = parsed
+        store = make_store(name, home, template, categories)
         if store.domain in seen:
-            log.warning("%s line %d ignored: %s is listed twice", path.name, number, store.domain)
             continue
         seen.add(store.domain)
         stores.append(store)
@@ -262,31 +263,27 @@ def store_for_url(url: str) -> Optional[Store]:
     for store in STORES:
         if host.endswith(store.domain):
             return store
-    for domain, cfg in KNOWN.items():            # shop no longer in stores.txt, but still known
+    for domain, cfg in KNOWN.items():
         if host.endswith(domain):
             return make_store(cfg["key"], f"https://{host}")
     return None
 
 
 # --------------------------------------------------------------------------- #
-# Exceptions & data classes
+# Exceptions & Data Models
 # --------------------------------------------------------------------------- #
 
 class FetchError(Exception):
-    """A page could not be downloaded (network error, block, timeout ...)."""
-
+    """Page could not be downloaded."""
 
 class RobotsDisallowed(FetchError):
     """robots.txt forbids fetching this URL."""
 
-
 class ExtractionError(Exception):
-    """A page was loaded but the wanted data could not be found in it."""
-
+    """Page loaded but required data missing."""
 
 class PriceParseError(Exception):
-    """A price string could not be converted to a number."""
-
+    """Price string conversion failed."""
 
 @dataclass
 class Product:
@@ -299,7 +296,7 @@ class Product:
 
 
 # --------------------------------------------------------------------------- #
-# Query cleaning
+# Query & Relevance Engine
 # --------------------------------------------------------------------------- #
 
 _ALNUM = "0-9a-zåäöé"
@@ -308,17 +305,16 @@ _TOKEN_RE = re.compile(rf"[{_ALNUM}]+(?:[-.][{_ALNUM}]+)*")
 
 
 def normalize(text: str) -> str:
-    """Lowercase and strip everything except letters/digits: 'WH-1000XM5' -> 'wh1000xm5'."""
     return re.sub(rf"[^{_ALNUM}]", "", text.lower())
 
 
 @dataclass
 class Query:
     raw: str
-    keywords: str          # cleaned text sent to the stores' search boxes
-    tokens: list           # normalised tokens used for matching
-    must: list             # tokens that contain digits (model numbers) - mandatory
-    excludes: list         # normalised words that disqualify a result
+    keywords: str
+    tokens: list
+    must: list
+    excludes: list
     min_price: Optional[float] = None
     max_price: Optional[float] = None
 
@@ -326,13 +322,12 @@ class Query:
 def parse_query(raw: str, excludes: Optional[list] = None,
                 min_price: Optional[float] = None,
                 max_price: Optional[float] = None) -> Query:
-    """Clean a free-text query into search keywords + matching rules."""
     cleaned = " ".join(raw.replace("\u00a0", " ").split())
-    raw_tokens = list(dict.fromkeys(_TOKEN_RE.findall(cleaned.lower())))  # de-duplicated
+    raw_tokens = list(dict.fromkeys(_TOKEN_RE.findall(cleaned.lower())))
     raw_tokens = [t for t in raw_tokens if t not in _STOPWORDS] or raw_tokens
     tokens = [t for t in (normalize(t) for t in raw_tokens) if t]
     if not tokens:
-        raise ValueError("The search query contains no usable words.")
+        raise ValueError("Search query contains no usable words.")
     return Query(
         raw=cleaned,
         keywords=" ".join(raw_tokens),
@@ -344,13 +339,8 @@ def parse_query(raw: str, excludes: Optional[list] = None,
     )
 
 
-def relevance(query: Query, *texts: str, min_score: float = 0.6) -> Optional[float]:
-    """
-    Score 0..1 for how well the given texts (link text, URL path, product name)
-    match the query, or None if the result must be rejected.
-    """
+def relevance(query: Query, *texts: str, min_score: float = 0.5) -> Optional[float]:
     joined = " ".join(texts)
-    # Excluded words match whole words only ("ram" must not reject "fRAMe").
     words = re.findall(rf"[{_ALNUM}]+", joined.lower())
     if any(w.startswith(e) for e in query.excludes for w in words):
         return None
@@ -362,27 +352,14 @@ def relevance(query: Query, *texts: str, min_score: float = 0.6) -> Optional[flo
 
 
 # --------------------------------------------------------------------------- #
-# Price cleaning
+# Price Parsing
 # --------------------------------------------------------------------------- #
 
-_PRICE_RE = re.compile(
-    r"\d{1,3}(?:[ .]\d{3})+(?:[,.]\d{1,2})?"   # with thousands separators
-    r"|\d+(?:[,.]\d{1,2})?"                    # plain number
-)
+_PRICE_RE = re.compile(r"\d{1,3}(?:[ .]\d{3})+(?:[,.]\d{1,2})?|\d+(?:[,.]\d{1,2})?")
 
 
 def clean_swedish_price(raw: str) -> float:
-    """
-    Convert a Swedish price string to a float.
-
-      '1 299 kr' -> 1299.0     '1\u00a0299:-' -> 1299.0     '1 299,50 kr' -> 1299.5
-      '1.299,00 SEK' -> 1299.0     'Fr. 499 kr' -> 499.0
-
-    If several numbers appear, the FIRST is used.
-    """
-    text = (
-        raw.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2009", " ").strip()
-    )
+    text = raw.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2009", " ").strip()
     match = _PRICE_RE.search(text)
     if not match:
         raise PriceParseError(f"No number found in price text: {raw!r}")
@@ -395,27 +372,26 @@ def clean_swedish_price(raw: str) -> float:
     try:
         return float(number)
     except ValueError as exc:
-        raise PriceParseError(f"Could not convert {number!r} to a number") from exc
+        raise PriceParseError(f"Could not convert {number!r} to float") from exc
 
 
 def _to_number(value) -> Optional[float]:
-    """Turn a structured-data value (number or string) into a positive float, else None."""
     if value is None or isinstance(value, bool):
         return None
     try:
         if isinstance(value, (int, float)):
             number = float(value)
         elif re.fullmatch(r"\s*\d+(?:\.\d+)?\s*", str(value)):
-            number = float(value)               # machine format: "1299.00"
+            number = float(value)
         else:
-            number = clean_swedish_price(str(value))   # human format: "1 299 kr"
+            number = clean_swedish_price(str(value))
     except (PriceParseError, ValueError):
         return None
     return number if number > 0 else None
 
 
 # --------------------------------------------------------------------------- #
-# Fetching: requests first, Playwright as a fallback
+# Web Fetcher & Robots.txt Engine
 # --------------------------------------------------------------------------- #
 
 def _build_session() -> requests.Session:
@@ -436,7 +412,6 @@ _BLOCK_MARKERS = ("captcha", "access denied", "attention required",
 
 
 def allowed_by_robots(url: str) -> bool:
-    """Check robots.txt (cached per host). If it cannot be read, we allow the fetch."""
     if not CFG.respect_robots:
         return True
     parts = urlsplit(url)
@@ -456,9 +431,8 @@ def allowed_by_robots(url: str) -> bool:
 
 
 def fetch_requests(url: str) -> str:
-    """Download a page with plain `requests`."""
     if not allowed_by_robots(url):
-        raise RobotsDisallowed("disallowed by robots.txt - add product pages directly with --url")
+        raise RobotsDisallowed("disallowed by robots.txt")
     try:
         resp = SESSION.get(url, timeout=(8, CFG.timeout))
     except requests.exceptions.Timeout as exc:
@@ -472,7 +446,7 @@ def fetch_requests(url: str) -> str:
         raise FetchError(f"HTTP {resp.status_code}")
 
     if resp.encoding is None or resp.encoding.lower() == "iso-8859-1":
-        resp.encoding = "utf-8"          # avoid mangled å/ä/ö
+        resp.encoding = "utf-8"
     html = resp.text
     if len(html) < 30000 and any(m in html.lower() for m in _BLOCK_MARKERS):
         raise FetchError("bot-protection page returned")
@@ -491,7 +465,6 @@ def playwright_available() -> bool:
 
 
 def _playwright_context():
-    """Start one shared headless browser lazily (reused for every page)."""
     if _PW["context"] is None:
         from playwright.sync_api import sync_playwright
         _PW["pw"] = sync_playwright().start()
@@ -520,9 +493,8 @@ atexit.register(close_browser)
 
 
 def fetch_playwright(url: str) -> str:
-    """Download a page with a headless browser (renders JavaScript)."""
     if not allowed_by_robots(url):
-        raise RobotsDisallowed("disallowed by robots.txt - add product pages directly with --url")
+        raise RobotsDisallowed("disallowed by robots.txt")
     try:
         page = _playwright_context().new_page()
         try:
@@ -530,7 +502,7 @@ def fetch_playwright(url: str) -> str:
             try:
                 page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
-                pass                      # some sites never go idle; use what we have
+                pass
             return page.content()
         finally:
             page.close()
@@ -546,19 +518,9 @@ def _dump_html(url: str, html: str, used_js: bool) -> None:
     if CFG.dump_dir:
         name = f"{hashlib.sha1(url.encode()).hexdigest()[:8]}_{'js' if used_js else 'raw'}.html"
         (CFG.dump_dir / name).write_text(html, encoding="utf-8")
-        log.info("Saved HTML for %s -> %s", url, CFG.dump_dir / name)
 
 
 def fetch_and_extract(url: str, extractor: Callable[[str], object]):
-    """
-    Fetch `url` and run `extractor(html)` on it.
-
-    In 'auto' mode we try plain requests first. If the page LOADED but the
-    extractor found nothing (typical for JavaScript-rendered pages), we render it
-    with Playwright when it is installed. If the shop refused or reset the
-    connection we stop: a browser would not change that, and this tool does not
-    try to get around blocks.
-    """
     if CFG.js_mode == "never":
         modes = [False]
     elif CFG.js_mode == "always":
@@ -577,51 +539,20 @@ def fetch_and_extract(url: str, extractor: Callable[[str], object]):
                 return result
             last_error = ExtractionError("nothing usable found")
         except RobotsDisallowed:
-            raise                                     # retrying with JS would not help
+            raise
         except FetchError as exc:
             last_error = exc
             if not use_js and CFG.js_mode == "auto":
-                break                                 # blocked/unreachable: give up on this page
+                break
         except ExtractionError as exc:
             last_error = exc
-            log.debug("Attempt (js=%s) found nothing at %s: %s", use_js, url, exc)
-    if (isinstance(last_error, ExtractionError) and CFG.js_mode != "always"
-            and not playwright_available()):
-        last_error = ExtractionError(
-            f"{last_error} - the page may be JavaScript-rendered; install Playwright: "
-            "pip install playwright && playwright install chromium")
     raise last_error
 
 
 # --------------------------------------------------------------------------- #
-# Product IDs
+# Product Page Extraction
 # --------------------------------------------------------------------------- #
 
-def canonicalize(url: str) -> str:
-    """https://Host/path/?utm=1#x -> https://host/path (query and fragment dropped)."""
-    parts = urlsplit(url)
-    return f"https://{parts.netloc.lower()}{parts.path.rstrip('/')}"
-
-
-def product_id_for(url: str, store: Optional[Store]) -> str:
-    """
-    Stable 12-char ID. Uses the shop's own product number when we know how to
-    read it (survives slug changes); otherwise a hash of the canonical URL.
-    """
-    path = urlsplit(url).path
-    if store and store.id_re:
-        match = store.id_re.search(path)
-        if match:
-            return hashlib.sha1(f"{store.key}:{match.group(1)}".encode()).hexdigest()[:12]
-    return hashlib.sha1(canonicalize(url).encode()).hexdigest()[:12]
-
-
-# --------------------------------------------------------------------------- #
-# Generic product-page parsing (no per-store selectors)
-# --------------------------------------------------------------------------- #
-
-# Last-resort CSS patterns, tried in order. A match only counts if its text
-# looks like money ("kr", ":-", "SEK") so we don't pick up random numbers.
 PRICE_CSS_PATTERNS = [
     '[data-testid*="price" i]',
     '[class*="product-price" i]',
@@ -632,8 +563,21 @@ PRICE_CSS_PATTERNS = [
 ]
 
 
+def canonicalize(url: str) -> str:
+    parts = urlsplit(url)
+    return f"https://{parts.netloc.lower()}{parts.path.rstrip('/')}"
+
+
+def product_id_for(url: str, store: Optional[Store]) -> str:
+    path = urlsplit(url).path
+    if store and store.id_re:
+        match = store.id_re.search(path)
+        if match:
+            return hashlib.sha1(f"{store.key}:{match.group(1)}".encode()).hexdigest()[:12]
+    return hashlib.sha1(canonicalize(url).encode()).hexdigest()[:12]
+
+
 def _flatten_ld(node):
-    """Yield every dict inside a JSON-LD structure (lists, @graph, nested items)."""
     if isinstance(node, list):
         for item in node:
             yield from _flatten_ld(item)
@@ -660,13 +604,12 @@ def _has_type(node: dict, wanted: str) -> bool:
 
 
 def _offer_price(offer):
-    """Return (price, currency) from a schema.org Offer / AggregateOffer, or (None, None)."""
     if isinstance(offer, list):
         found = [r for r in (_offer_price(o) for o in offer) if r[0] is not None]
         return min(found, key=lambda r: r[0]) if found else (None, None)
     if not isinstance(offer, dict):
         return None, None
-    if "offers" in offer:                          # AggregateOffer with nested offers
+    if "offers" in offer:
         nested = _offer_price(offer["offers"])
         if nested[0] is not None:
             return nested
@@ -692,65 +635,41 @@ def _meta(soup: BeautifulSoup, *names: str) -> Optional[str]:
 
 
 def _element_price(element) -> Optional[float]:
-    value = element.get("content") or element.get("data-price") \
-        or element.get_text(" ", strip=True)
+    value = element.get("content") or element.get("data-price") or element.get_text(" ", strip=True)
     return _to_number(value)
 
 
-def _tidy_name(text: str) -> str:
-    return " ".join(text.split())[:200]
-
-
-def extract_product_data(html: str, name_selector: Optional[str] = None,
-                         price_selector: Optional[str] = None):
-    """
-    Return (name, price, currency) from a product page, trying in order:
-      0. selectors given by the user (optional override)
-      1. JSON-LD  (<script type="application/ld+json">, schema.org Product)
-      2. microdata (itemprop="price")
-      3. meta tags (product:price:amount, og:price:amount)
-      4. common price CSS patterns
-    Raises ExtractionError if no price or no name can be found.
-    """
+def extract_product_data(html: str, name_selector: Optional[str] = None, price_selector: Optional[str] = None):
     soup = BeautifulSoup(html, "html.parser")
     name = price = currency = None
 
-    # 0. explicit overrides
     if price_selector:
         el = soup.select_one(price_selector)
         price = _element_price(el) if el else None
     if name_selector:
         el = soup.select_one(name_selector)
-        name = _tidy_name(el.get_text(" ", strip=True)) if el else None
+        name = " ".join(el.get_text(" ", strip=True).split()) if el else None
 
-    # 1. JSON-LD
     if price is None or name is None:
         for node in _iter_jsonld(soup):
             if not _has_type(node, "Product"):
                 continue
             if name is None and isinstance(node.get("name"), str):
-                name = _tidy_name(node["name"])
+                name = " ".join(node["name"].split())
             if price is None:
                 price, currency = _offer_price(node.get("offers"))
             if name and price is not None:
                 break
 
-    # 2. microdata
     if price is None:
         el = soup.select_one('[itemprop="price"]')
         if el:
             price = _element_price(el)
-            cur_el = soup.select_one('[itemprop="priceCurrency"]')
-            currency = currency or (cur_el.get("content") or cur_el.get_text(strip=True)
-                                    if cur_el else None)
 
-    # 3. meta tags
     if price is None:
-        price = _to_number(_meta(soup, "product:price:amount", "og:price:amount",
-                                 "product:sale_price:amount"))
+        price = _to_number(_meta(soup, "product:price:amount", "og:price:amount", "product:sale_price:amount"))
         currency = currency or _meta(soup, "product:price:currency", "og:price:currency")
 
-    # 4. CSS patterns (must look like money)
     if price is None:
         for selector in PRICE_CSS_PATTERNS:
             for el in soup.select(selector)[:6]:
@@ -762,7 +681,6 @@ def extract_product_data(html: str, name_selector: Optional[str] = None,
             if price is not None:
                 break
 
-    # Name fallbacks
     if not name:
         og = _meta(soup, "og:title")
         h1 = soup.find("h1")
@@ -770,7 +688,7 @@ def extract_product_data(html: str, name_selector: Optional[str] = None,
         for candidate in (og, h1.get_text(" ", strip=True) if h1 else None,
                           title.get_text(" ", strip=True) if title else None):
             if candidate:
-                name = _tidy_name(candidate)
+                name = " ".join(candidate.split())
                 break
 
     if price is None:
@@ -780,52 +698,43 @@ def extract_product_data(html: str, name_selector: Optional[str] = None,
     return name, price, (currency or "SEK").upper()
 
 
+def scrape_product(url: str, store_name: str, query: Optional[Query] = None,
+                   name_selector: Optional[str] = None,
+                   price_selector: Optional[str] = None) -> Product:
+    def extractor(html: str):
+        name, price, currency = extract_product_data(html, name_selector, price_selector)
+        if query and relevance(query, name, urlsplit(url).path) is None:
+            raise ExtractionError(f"page '{name[:60]}' does not match search")
+        if query and query.min_price is not None and price < query.min_price:
+            raise ExtractionError(f"price {price:g} kr below --min-price")
+        if query and query.max_price is not None and price > query.max_price:
+            raise ExtractionError(f"price {price:g} kr above --max-price")
+        return name, price, currency
+
+    name, price, currency = fetch_and_extract(url, extractor)
+    return Product(product_id_for(url, store_for_url(url)), store_name, name, price, canonicalize(url), currency)
+
+
 # --------------------------------------------------------------------------- #
-# Store search: find candidate product URLs
+# Store Search & Sitemap Fallback Engine
 # --------------------------------------------------------------------------- #
 
 _MONEY_RE = re.compile(r"\d[\d\s\u00a0.,]*\s?(?:kr|:-|sek)\b", re.I)
 _ASSET_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|svg|pdf|xml|css|js|ico)$", re.I)
-_SKIP_HREF = ("#", "javascript:", "mailto:", "tel:")
+CACHE_DIR = Path(".price_monitor_cache")
+SITEMAP_TTL = 7 * 24 * 3600
 
 
 def _is_product_like(store: Store, url: str) -> bool:
-    """Known shops: product_re decides. Unknown shops: any real page (verified later)."""
     path = urlsplit(url).path
     if store.product_re is not None:
         return bool(store.product_re.search(path))
     return path not in ("", "/") and not _ASSET_RE.search(path)
 
 
-def _price_card_text(anchor) -> Optional[str]:
-    """Text of the product 'card' around a link, if that card shows a price."""
-    node = anchor
-    for _ in range(5):
-        if node is None or not hasattr(node, "get_text"):
-            return None
-        text = node.get_text(" ", strip=True)
-        if len(text) > 600:                       # climbed into the whole page: not a card
-            return None
-        if len({a.get("href") for a in node.find_all("a", href=True)}) > 3:
-            return None                           # a container of many links, not one product card
-        if _MONEY_RE.search(text):
-            return text
-        node = node.parent
-    return None
-
-
 def find_ranked_links(html: str, store: Store, base_url: str, query: Query) -> list:
-    """
-    Collect product-page URLs from a search results page and rank them by how
-    well they match the query.
-
-    Known shops: links matching the shop's product_re, from <a> tags AND from
-    paths hidden in embedded JSON (__NEXT_DATA__ etc.).
-    Other shops: links that sit inside a card showing a price, plus JSON-LD
-    item lists. Wrong guesses are weeded out when the page itself is read.
-    """
     soup = BeautifulSoup(html, "html.parser")
-    found: dict = {}                      # product_id -> {"url": ..., "text": ...}
+    found: dict = {}
 
     def add(href: str, text: str = "") -> None:
         url = canonicalize(urljoin(base_url, href))
@@ -837,23 +746,13 @@ def find_ranked_links(html: str, store: Store, base_url: str, query: Query) -> l
 
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        if href.startswith(_SKIP_HREF):
+        if href.startswith(("#", "javascript:", "mailto:", "tel:")):
             continue
-        if store.product_re is not None:
-            add(href, a.get_text(" ", strip=True)[:200])
-        else:
-            card = _price_card_text(a)
-            if card:
-                add(href, card[:300])
+        add(href, a.get_text(" ", strip=True)[:200])
 
     if store.product_re is not None:
         for match in store.product_re.finditer(html.replace("\\/", "/")):
             add(match.group(0))
-    else:
-        for node in _iter_jsonld(soup):
-            url = node.get("url")
-            if isinstance(url, str) and (_has_type(node, "Product") or _has_type(node, "ListItem")):
-                add(url, str(node.get("name") or ""))
 
     ranked = []
     for order, entry in enumerate(found.values()):
@@ -861,254 +760,52 @@ def find_ranked_links(html: str, store: Store, base_url: str, query: Query) -> l
         if score is not None:
             ranked.append((-score, order, entry["url"]))
     ranked.sort()
-    if not ranked:
-        raise ExtractionError(
-            f"{len(found)} product link(s) seen, none matching '{query.keywords}'")
     return [url for _, _, url in ranked]
 
 
-def scrape_product(url: str, store_name: str, query: Optional[Query] = None,
-                   name_selector: Optional[str] = None,
-                   price_selector: Optional[str] = None) -> Product:
-    """Fetch one product page and return a Product (raises FetchError/ExtractionError)."""
-    def extractor(html: str):
-        name, price, currency = extract_product_data(html, name_selector, price_selector)
-        if query and relevance(query, name, urlsplit(url).path) is None:
-            raise ExtractionError(f"page '{name[:60]}' does not match the search")
-        if query and query.min_price is not None and price < query.min_price:
-            raise ExtractionError(f"price {price:g} kr is below --min-price")
-        if query and query.max_price is not None and price > query.max_price:
-            raise ExtractionError(f"price {price:g} kr is above --max-price")
-        return name, price, currency
-
-    name, price, currency = fetch_and_extract(url, extractor)
-    if currency != "SEK":
-        raise ExtractionError(f"unexpected currency {currency}")
-    return Product(product_id_for(url, store_for_url(url)),
-                   store_name, name, price, canonicalize(url), currency)
-
-
-def fill_search_url(template: str, keywords: str) -> str:
-    return template.replace("{q}", quote_plus(keywords))
-
-
-def _load_json(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
-_SEARCH_FIELD_RE = re.compile(
-    r"^(q|query|search|s|searchstring|searchterm|text|keyword|keywords|sok|term)$", re.I)
-
-
-def _find_search_template(html: str, home: str) -> str:
-    """Detect a shop's search URL (as a template with {q}) from its home page."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1. schema.org SearchAction in JSON-LD - the shop declares its search URL itself
-    for node in _iter_jsonld(soup):
-        actions = node.get("potentialAction")
-        for action in (actions if isinstance(actions, list) else [actions]):
-            if isinstance(action, dict) and _has_type(action, "SearchAction"):
-                target = action.get("target")
-                if isinstance(target, dict):
-                    target = target.get("urlTemplate")
-                if isinstance(target, str) and "{" in target:
-                    return re.sub(r"\{[^}]*\}", "{q}", urljoin(home, target))
-
-    # 2. an ordinary GET search form
-    for form in soup.find_all("form"):
-        if (form.get("method") or "get").lower() != "get":
-            continue
-        field = (form.find("input", attrs={"type": "search"})
-                 or form.find("input", attrs={"name": _SEARCH_FIELD_RE}))
-        if not field or not field.get("name"):
-            continue
-        action = urljoin(home, form.get("action") or home)
-        params = [f"{quote_plus(field['name'])}={{q}}"]
-        for hidden in form.find_all("input", attrs={"type": "hidden"}):
-            if hidden.get("name") and hidden.get("value"):
-                params.append(f"{quote_plus(hidden['name'])}={quote_plus(hidden['value'])}")
-        return action + ("&" if "?" in action else "?") + "&".join(params)
-
-    raise ExtractionError("could not detect the search page - add its URL (with {q}) in stores.txt")
-
-
-def resolve_search_template(store: Store) -> str:
-    """The shop's search URL template: from stores.txt/KNOWN, the cache, or auto-detected."""
-    if store.search_url:
-        return store.search_url
-    cache_file = CACHE_DIR / "search_urls.json"
-    cache = _load_json(cache_file)
-    if store.domain in cache:
-        return cache[store.domain]
-    log.info("[%s] detecting the search page from %s", store.name, store.home)
-    template = fetch_and_extract(store.home, lambda html: _find_search_template(html, store.home))
-    cache[store.domain] = template
-    try:
-        CACHE_DIR.mkdir(exist_ok=True)
-        cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-    log.info("[%s] search page: %s", store.name, template)
-    return template
-
-
-def _skip_label(exc: Exception) -> str:
-    message = str(exc)
-    if "does not match" in message:
-        return "name mismatch"
-    if "min-price" in message or "max-price" in message:
-        return "price filter"
-    if isinstance(exc, RobotsDisallowed):
-        return "robots.txt"
-    return "error"
-
-
-def search_store(store: Store, query: Query, max_results: int) -> list:
-    """
-    Search one store. Candidates are checked one by one until `max_results`
-    have been ACCEPTED (or a check budget is used up), so rejected candidates
-    (accessories, price filter ...) do not reduce the result count.
-    """
-    source = "search page"
-    try:
-        template = resolve_search_template(store)
-        search_url = fill_search_url(template, query.keywords)
-        log.info("[%s] searching: %s", store.name, search_url)
-        links = fetch_and_extract(
-            search_url, lambda html: find_ranked_links(html, store, search_url, query))
-    except (RobotsDisallowed, ExtractionError) as exc:
-        log.info("[%s] search page not usable (%s) - trying the store's sitemap", store.name, exc)
-        try:
-            links = sitemap_links(store, query)
-        except (FetchError, ExtractionError) as exc2:
-            raise ExtractionError(f"search: {exc}; sitemap: {exc2}") from exc2
-        source = "sitemap"
-
-    max_checks = max(max_results * 4, 12)
-    log.info("[%s] %d candidate(s) from the %s; checking until %d match (max %d page checks)",
-             store.name, len(links), source, max_results, max_checks)
-
-    products: list = []
-    skipped: Counter = Counter()
-    checked = 0
-    for link in links:
-        if len(products) >= max_results or checked >= max_checks:
-            break
-        checked += 1
-        try:
-            products.append(scrape_product(link, store.name, query))
-        except (FetchError, ExtractionError) as exc:
-            label = _skip_label(exc)
-            skipped[label] += 1
-            (log.warning if label == "error" else log.debug)(
-                "[%s] skipped %s: %s", store.name, link, exc)
-
-    detail = ", ".join(f"{n} {label}" for label, n in skipped.items()) or "none"
-    log.info("[%s] checked %d page(s): %d accepted, skipped: %s",
-             store.name, checked, len(products), detail)
-    if not products:
-        raise ExtractionError(f"{len(links)} candidate(s) but none usable (skipped: {detail})")
-    if len(products) < max_results and checked < len(links):
-        log.info("[%s] stopped after %d checks - raise --max-per-store to look further",
-                 store.name, checked)
-    return products
-
-
-# --------------------------------------------------------------------------- #
-# Discovery through the store's published sitemaps
-# --------------------------------------------------------------------------- #
-# Sitemaps are files shops publish *for* automated clients. When a store's
-# robots.txt forbids its search page, we can still find matching product pages
-# by name in the sitemap (product pages are checked against robots.txt too).
-
-CACHE_DIR = Path(".price_monitor_cache")
-SITEMAP_TTL = 7 * 24 * 3600
-MAX_SITEMAP_FILES = 40
-MAX_SITEMAP_BYTES = 60_000_000
-
-
-def _site_base(store: Store) -> str:
-    parts = urlsplit(store.home)
-    return f"{parts.scheme}://{parts.netloc}"
-
-
-def _sitemaps_listed_in_robots(base: str) -> list:
-    allowed_by_robots(base + "/")                   # makes sure robots.txt is loaded
-    parser = _ROBOTS.get(base)
-    maps = parser.site_maps() if parser else None
-    return list(maps) if maps else [base + "/sitemap.xml"]
-
-
-def _fetch_sitemap(url: str) -> str:
-    if not allowed_by_robots(url):
-        raise RobotsDisallowed("sitemap disallowed by robots.txt")
-    _polite_delay()
-    try:
-        resp = SESSION.get(url, timeout=(8, 60))
-    except requests.exceptions.RequestException as exc:
-        raise FetchError(f"sitemap network error: {exc}") from exc
-    if resp.status_code != 200:
-        raise FetchError(f"sitemap HTTP {resp.status_code}")
-    data = resp.content
-    if data[:2] == b"\x1f\x8b":                      # .xml.gz
-        data = gzip.decompress(data)
-    if len(data) > MAX_SITEMAP_BYTES:
-        raise FetchError("sitemap too large")
-    return data.decode("utf-8", errors="replace")
-
-
 def load_store_urls(store: Store) -> list:
-    """Every product URL listed in the store's sitemaps (cached for a week)."""
     cache = CACHE_DIR / f"{store.domain}_urls.txt.gz"
     if cache.exists() and time.time() - cache.stat().st_mtime < SITEMAP_TTL:
         return gzip.decompress(cache.read_bytes()).decode("utf-8").splitlines()
 
-    log.info("[%s] reading the store's sitemaps (first run is slow, then cached 7 days)",
-             store.name)
-    queue = _sitemaps_listed_in_robots(_site_base(store))
+    log.info("[%s] Fetching sitemaps...", store.name)
+    base = f"https://{store.domain}"
+    allowed_by_robots(base + "/")
+    parser = _ROBOTS.get(base)
+    queue = list(parser.site_maps()) if parser and parser.site_maps() else [base + "/sitemap.xml"]
+    
     seen: set = set()
     urls: list = []
-    files = 0
-    last_error: Optional[Exception] = None
-    while queue and files < MAX_SITEMAP_FILES:
+    while queue and len(seen) < 30:
         sitemap = queue.pop(0)
         if sitemap in seen:
             continue
         seen.add(sitemap)
         try:
-            xml = _fetch_sitemap(sitemap)
-        except FetchError as exc:
-            last_error = exc
-            log.debug("[%s] %s: %s", store.name, sitemap, exc)
-            continue
-        files += 1
-        locs = [htmllib.unescape(m.strip()) for m in re.findall(
-            r"<loc>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</loc>", xml, re.S)]
-        if "<sitemapindex" in xml[:3000]:
-            queue.extend([l for l in locs if "product" in l.lower()] or locs)
-        else:
-            urls.extend(canonicalize(l) for l in locs
-                        if _is_product_like(store, l))
-    if queue and files >= MAX_SITEMAP_FILES:
-        log.warning("[%s] stopped after %d sitemap files (list may be incomplete)",
-                    store.name, MAX_SITEMAP_FILES)
-    if not urls:
-        raise ExtractionError(f"no product URLs in the sitemaps ({last_error or 'none listed'})")
+            resp = SESSION.get(sitemap, timeout=15)
+            if resp.status_code != 200:
+                continue
+            data = resp.content
+            if data[:2] == b"\x1f\x8b":
+                data = gzip.decompress(data)
+            xml = data.decode("utf-8", errors="replace")
+            locs = [htmllib.unescape(m.strip()) for m in re.findall(r"<loc>(.*?)</loc>", xml, re.S)]
+            if "<sitemapindex" in xml[:2000]:
+                queue.extend(locs)
+            else:
+                urls.extend(canonicalize(l) for l in locs if _is_product_like(store, l))
+        except Exception as exc:
+            log.debug("[%s] Error loading sitemap %s: %s", store.name, sitemap, exc)
+
     CACHE_DIR.mkdir(exist_ok=True)
-    cache.write_bytes(gzip.compress("\n".join(urls).encode("utf-8")))
+    if urls:
+        cache.write_bytes(gzip.compress("\n".join(urls).encode("utf-8")))
     return urls
 
 
 def sitemap_links(store: Store, query: Query) -> list:
-    """Rank sitemap URLs by how well their slug matches the query."""
     ranked = []
     for order, url in enumerate(load_store_urls(store)):
-        # Loose pre-filter: slugs often lack the brand. The page's real name is
-        # checked strictly later, in scrape_product().
         score = relevance(query, urlsplit(url).path, min_score=0.4)
         if score is not None:
             ranked.append((-score, order, url))
@@ -1116,427 +813,180 @@ def sitemap_links(store: Store, query: Query) -> list:
     unique: dict = {}
     for _, _, url in ranked:
         unique.setdefault(product_id_for(url, store), url)
-    if not unique:
-        raise ExtractionError(f"no URL in the sitemap matches '{query.keywords}'")
     return list(unique.values())
 
 
+def search_store(store: Store, query: Query, max_results: int) -> list:
+    source = "search page"
+    try:
+        if not store.search_url:
+            raise ExtractionError("No search URL configured")
+        search_url = store.search_url.replace("{q}", quote_plus(query.keywords))
+        log.info("[%s] searching: %s", store.name, search_url)
+        links = fetch_and_extract(
+            search_url, lambda html: find_ranked_links(html, store, search_url, query))
+    except (RobotsDisallowed, ExtractionError, FetchError) as exc:
+        log.info("[%s] Search failed (%s) - attempting sitemap discovery fallback", store.name, exc)
+        try:
+            links = sitemap_links(store, query)
+            source = "sitemap"
+        except Exception as exc2:
+            raise ExtractionError(f"search: {exc}; sitemap: {exc2}") from exc2
+
+    products = []
+    for link in links[:max_results * 3]:
+        if len(products) >= max_results:
+            break
+        try:
+            products.append(scrape_product(link, store.name, query))
+        except Exception as exc:
+            log.debug("[%s] skipped candidate %s: %s", store.name, link, exc)
+
+    if not products:
+        raise ExtractionError("No matching products accepted")
+    return products
+
+
 # --------------------------------------------------------------------------- #
-# Database
+# Database & Tracking Engine
 # --------------------------------------------------------------------------- #
 
 def init_db(db_path: str) -> sqlite3.Connection:
-    """Open/create the DB. Upgrades the old single-URL schema in place (no data loss)."""
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS price_history (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            url          TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
             product_name TEXT,
-            price        REAL NOT NULL,
-            scanned_at   TEXT NOT NULL
+            price REAL NOT NULL,
+            scanned_at TEXT NOT NULL,
+            product_id TEXT,
+            store TEXT
         )
         """
     )
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(price_history)")}
-    for col in ("product_id", "store"):
-        if col not in columns:
-            conn.execute(f"ALTER TABLE price_history ADD COLUMN {col} TEXT")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_url_time ON price_history (url, scanned_at)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_pid ON price_history (product_id)")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS tracked_products (
-            product_id   TEXT PRIMARY KEY,
-            url          TEXT NOT NULL,
-            store        TEXT,
-            name         TEXT,
+            product_id TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            store TEXT,
+            name TEXT,
             search_query TEXT,
-            first_seen   TEXT NOT NULL,
-            last_seen    TEXT NOT NULL
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL
         )
         """
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS store_health "
-        "(store TEXT PRIMARY KEY, failed_at TEXT NOT NULL, reason TEXT)"
     )
     conn.commit()
     return conn
 
 
-def get_previous_and_lowest(conn: sqlite3.Connection, product: Product):
-    """Return (previous_price, lowest_price) recorded for this product (None, None if new)."""
-    where = "product_id = ? OR url = ?"
-    args = (product.product_id, product.url)
-    prev = conn.execute(
-        f"SELECT price FROM price_history WHERE {where} ORDER BY id DESC LIMIT 1", args
-    ).fetchone()
-    low = conn.execute(
-        f"SELECT MIN(price) FROM price_history WHERE {where}", args
-    ).fetchone()
-    return (prev[0] if prev else None), (low[0] if low else None)
-
-
 def save_price(conn: sqlite3.Connection, product: Product, query_text: Optional[str]) -> None:
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
-        "INSERT INTO price_history (url, product_name, price, scanned_at, product_id, store) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO price_history (url, product_name, price, scanned_at, product_id, store) VALUES (?, ?, ?, ?, ?, ?)",
         (product.url, product.name, product.price, now, product.product_id, product.store),
     )
     conn.execute(
         """
-        INSERT INTO tracked_products
-            (product_id, url, store, name, search_query, first_seen, last_seen)
+        INSERT INTO tracked_products (product_id, url, store, name, search_query, first_seen, last_seen)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(product_id) DO UPDATE SET
-            url = excluded.url,
-            name = excluded.name,
-            last_seen = excluded.last_seen,
-            search_query = COALESCE(excluded.search_query, tracked_products.search_query)
+            url = excluded.url, name = excluded.name, last_seen = excluded.last_seen
         """,
-        (product.product_id, product.url, product.store, product.name,
-         query_text, now, now),
+        (product.product_id, product.url, product.store, product.name, query_text, now, now),
     )
     conn.commit()
 
 
-HEALTH_TTL = 24 * 3600
-
-
-def record_failure(conn: sqlite3.Connection, store: str, reason: str) -> None:
-    conn.execute("INSERT OR REPLACE INTO store_health VALUES (?, ?, ?)",
-                 (store, datetime.now().isoformat(timespec="seconds"), reason[:150]))
-    conn.commit()
-
-
-def clear_failure(conn: sqlite3.Connection, store: str) -> None:
-    conn.execute("DELETE FROM store_health WHERE store = ?", (store,))
-    conn.commit()
-
-
-def recent_failure(conn: sqlite3.Connection, store: str) -> Optional[str]:
-    """Reason if the store blocked us within the last 24h, else None."""
-    row = conn.execute("SELECT failed_at, reason FROM store_health WHERE store = ?",
-                       (store,)).fetchone()
-    if row and (datetime.now() - datetime.fromisoformat(row[0])).total_seconds() < HEALTH_TTL:
-        return row[1]
-    return None
-
-
-# --------------------------------------------------------------------------- #
-# Reporting
-# --------------------------------------------------------------------------- #
-
-def fmt_sek(value: float) -> str:
-    """1299.5 -> '1 299,50 kr'; 1299 -> '1 299 kr'."""
-    if float(value).is_integer():
-        formatted = f"{int(value):,}".replace(",", " ")
-    else:
-        formatted = f"{value:,.2f}".replace(",", " ").replace(".", ",")
-    return f"{formatted} kr"
-
-
-def report_price_change(p: Product, previous: Optional[float], lowest: Optional[float]) -> None:
-    """Print a clear message comparing the current price with the previous scan."""
-    tag = f"[{p.store}] {p.name}"
-    if previous is None:
-        print(f"ℹ️  New product tracked: {tag}\n"
-              f"   {fmt_sek(p.price)} (baseline saved)\n   {p.url}")
-    elif p.price < previous:
-        diff = previous - p.price
-        extra = "\n   ⭐ Lowest price recorded so far!" if lowest is not None and p.price <= lowest else ""
-        print(f"🔻 PRICE DROP! {tag}\n"
-              f"   {fmt_sek(previous)}  ->  {fmt_sek(p.price)}  "
-              f"(-{fmt_sek(diff)}, -{diff / previous * 100:.1f}%){extra}\n   {p.url}")
-    elif p.price > previous:
-        diff = p.price - previous
-        print(f"🔺 Price increase: {tag}\n"
-              f"   {fmt_sek(previous)}  ->  {fmt_sek(p.price)}  "
-              f"(+{fmt_sek(diff)}, +{diff / previous * 100:.1f}%)\n   {p.url}")
-    else:
-        print(f"➖ No change: {tag} - still {fmt_sek(p.price)}\n   {p.url}")
-
-
 def handle_product(conn: sqlite3.Connection, product: Product, query_text: Optional[str]) -> None:
-    """Compare with history, report, then store the new price."""
-    previous, lowest = get_previous_and_lowest(conn, product)
-    report_price_change(product, previous, lowest)
     save_price(conn, product, query_text)
+    print(f"[{product.store}] {product.name} - {product.price:g} SEK\n   {product.url}")
 
 
 # --------------------------------------------------------------------------- #
-# Modes of operation
+# CLI & Interactive Wizard
 # --------------------------------------------------------------------------- #
 
-def run_search(conn: sqlite3.Connection, query: Query, args) -> dict:
-    """Search all selected stores. A failing store is logged and skipped."""
-    selected = [s for s in STORES if not args.stores or s.name.lower() in args.stores]
-    status: dict = {}
-    seen: set = set()
-    for store in selected:
-        if not args.retry_blocked:
-            reason = recent_failure(conn, store.name)
-            if reason:
-                log.info("[%s] skipped: refused us within the last 24h. "
-                         "Use --retry-blocked to try again.", store.name)
-                status[store.name] = f"SKIPPED  blocked recently ({reason})"
-                continue
-        try:
-            products = search_store(store, query, args.max_per_store)
-        except FetchError as exc:       # blocked / unreachable: remember it, don't hammer the site
-            log.error("[%s] failed: %s", store.name, exc)
-            status[store.name] = f"FAILED   {exc}"
-            if "timed out" not in str(exc):
-                record_failure(conn, store.name, str(exc))
-            continue
-        except Exception as exc:        # one broken retailer must not stop the rest
-            log.error("[%s] failed: %s", store.name, exc)
-            log.debug("Details", exc_info=True)
-            status[store.name] = f"FAILED   {exc}"
-            continue
-        clear_failure(conn, store.name)
-        count = 0
-        for product in products:
-            if product.product_id in seen:
-                continue
-            seen.add(product.product_id)
-            handle_product(conn, product, query.raw)
-            count += 1
-        status[store.name] = f"OK       {count} product(s)"
-    return status
+def prompt_user_for_input(all_stores: list[Store]) -> tuple[str, list[str]]:
+    query_text = input("Enter product to search for: ").strip()
+    if not query_text:
+        print("Search text cannot be empty.")
+        sys.exit(1)
 
+    categories_set = set()
+    for store in all_stores:
+        categories_set.update(store.categories)
+    sorted_categories = sorted(categories_set)
 
-def check_stores() -> None:
-    """Report which stores permit automated search pages and publish sitemaps."""
-    CFG.respect_robots = True
-    cache = _load_json(CACHE_DIR / "search_urls.json")
-    for store in STORES:
-        base = _site_base(store)
-        template = store.search_url or cache.get(store.domain)
-        if template:
-            ok = allowed_by_robots(fill_search_url(template, "test"))
-            search_note = "allowed" if ok else "DISALLOWED"
-        else:
-            allowed_by_robots(base + "/")                   # loads robots.txt
-            search_note = "detected on first search"
-        parser = _ROBOTS.get(base)
-        if parser is None:
-            note = "robots.txt unreadable"
-        else:
-            maps = parser.site_maps()
-            note = f"{len(maps) if maps else 0} sitemap(s) listed"
-        print(f"  {store.name:<14} search pages: {search_note:<26} {note}")
+    print("\nAvailable Categories:")
+    print("  [0] ALL Stores")
+    for idx, cat in enumerate(sorted_categories, 1):
+        print(f"  [{idx}] {cat.capitalize()}")
 
+    choice = input("\nSelect categories (e.g. 1, 3 or multiple separated by comma) [0]: ").strip()
+    selected_cats = []
 
-def run_recheck(conn: sqlite3.Connection) -> dict:
-    """Re-scan every tracked product directly by URL (no search step)."""
-    rows = conn.execute(
-        "SELECT product_id, url, store, search_query FROM tracked_products ORDER BY store, name"
-    ).fetchall()
-    if not rows:
-        print("Nothing tracked yet. Start with:  python price_monitor.py --search \"<product>\"")
-        return {}
-    status: dict = {}
-    for pid, url, store_name, query_text in rows:
-        store_name = store_name or urlsplit(url).netloc
-        counts = status.setdefault(store_name, {"ok": 0, "failed": []})
-        try:
-            product = scrape_product(url, store_name)
-            product.product_id = pid          # keep the ID the product was first stored with
-            handle_product(conn, product, query_text)
-            counts["ok"] += 1
-        except Exception as exc:        # keep going if a single page fails
-            log.error("[%s] %s: %s", store_name, url, exc)
-            counts["failed"].append(str(exc))
-    return _format_status(status)
+    if choice and choice != "0":
+        indices = [c.strip() for c in choice.split(",") if c.strip().isdigit()]
+        for idx_str in indices:
+            idx = int(idx_str)
+            if 1 <= idx <= len(sorted_categories):
+                selected_cats.append(sorted_categories[idx - 1])
 
-
-def _format_status(status: dict) -> dict:
-    out = {}
-    for store, v in status.items():
-        if not v["failed"]:
-            out[store] = f"OK       {v['ok']} product(s)"
-        elif v["ok"] == 0:
-            out[store] = f"FAILED   {v['failed'][0]}"
-        else:
-            out[store] = f"PARTIAL  {v['ok']} ok, {len(v['failed'])} failed: {v['failed'][0]}"
-    return out
-
-
-def run_single_url(conn: sqlite3.Connection, args) -> dict:
-    """Track one or more explicit product-page URLs (selectors optional)."""
-    status: dict = {}
-    for url in args.url:
-        store = store_for_url(url)
-        store_name = store.name if store else urlsplit(url).netloc
-        counts = status.setdefault(store_name, {"ok": 0, "failed": []})
-        try:
-            product = scrape_product(url, store_name,
-                                     name_selector=args.name_selector,
-                                     price_selector=args.price_selector)
-            handle_product(conn, product, None)
-            counts["ok"] += 1
-        except Exception as exc:
-            log.error("[%s] %s: %s", store_name, url, exc)
-            counts["failed"].append(str(exc))
-    return _format_status(status)
-
-
-def list_tracked(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT t.store, t.name, t.url,
-               (SELECT price FROM price_history h
-                 WHERE h.product_id = t.product_id ORDER BY h.id DESC LIMIT 1),
-               (SELECT MIN(price) FROM price_history h WHERE h.product_id = t.product_id)
-          FROM tracked_products t ORDER BY t.store, t.name
-        """
-    ).fetchall()
-    if not rows:
-        print("Nothing tracked yet.")
-        return
-    for store, name, url, last, low in rows:
-        print(f"[{store}] {name}\n   now {fmt_sek(last)}   lowest {fmt_sek(low)}\n   {url}")
-
-
-def print_summary(status: dict) -> bool:
-    """Print per-store results. Returns True if at least one store succeeded."""
-    if not status:
-        return True
-    print("\n--- Summary " + "-" * 50)
-    for store, text in status.items():
-        print(f"  {store:<12} {text}")
-    return any(text.startswith(("OK", "PARTIAL")) for text in status.values())
-
-
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Search Swedish web shops for a product and track its price.")
-    mode = p.add_argument_group("what to do")
-    mode.add_argument("--search", help='Product to look for, e.g. "Sony WH-1000XM5"')
-    mode.add_argument("--recheck", action="store_true", help="Re-scan all tracked products")
-    mode.add_argument("--list", action="store_true", help="List tracked products")
-    mode.add_argument("--check-stores", action="store_true",
-                      help="Show which stores allow automated search (robots.txt)")
-    mode.add_argument("--url", nargs="+", help="Track specific product page URL(s)")
-    mode.add_argument("--name-selector", help="(with --url) optional CSS selector override")
-    mode.add_argument("--price-selector", help="(with --url) optional CSS selector override")
-
-    opt = p.add_argument_group("options")
-    opt.add_argument("--stores-file", default=str(Path(__file__).with_name("stores.txt")),
-                     help="File listing the shops to search, one 'Name - home URL' per line "
-                          "(default: stores.txt next to this script)")
-    opt.add_argument("--stores", nargs="+", type=str.lower, metavar="STORE",
-                     help="Only search these shops from the file (default: all)")
-    opt.add_argument("--max-per-store", type=int, default=10,
-                     help="Products to collect per store (default 10)")
-    opt.add_argument("--refresh-cache", action="store_true",
-                     help="Delete cached sitemaps and detected search pages first")
-    opt.add_argument("--exclude", nargs="+", default=[],
-                     help="Words that disqualify a result, e.g. --exclude fodral skal")
-    opt.add_argument("--min-price", type=float, help="Ignore results cheaper than this (SEK)")
-    opt.add_argument("--max-price", type=float, help="Ignore results dearer than this (SEK)")
-    opt.add_argument("--retry-blocked", action="store_true",
-                     help="Also retry stores that refused us within the last 24h")
-    opt.add_argument("--db", default=DEFAULT_DB, help=f"SQLite file (default {DEFAULT_DB})")
-    opt.add_argument("--js", choices=["auto", "always", "never"], default="auto",
-                     help="Playwright usage: auto = only as fallback (default)")
-    opt.add_argument("--delay", type=float, default=1.5,
-                     help="Average pause between requests in seconds (default 1.5)")
-    opt.add_argument("--ignore-robots", action="store_true",
-                     help="Do not consult robots.txt (default: respect it)")
-    opt.add_argument("--dump-html", metavar="DIR",
-                     help="Save every fetched page here (for debugging store settings)")
-    opt.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
-    args = p.parse_args()
-
-    # Interactive fallback: no mode given and we are in a terminal -> ask.
-    if not (args.search or args.recheck or args.list or args.url or args.check_stores):
-        if sys.stdin.isatty():
-            args.search = input("Search for a product: ").strip()
-        if not args.search:
-            p.error("give one of --search, --recheck, --list, --url or --check-stores")
-    return args
+    return query_text, selected_cats
 
 
 def main() -> int:
-    args = parse_args()
-    if args.verbose:
-        log.setLevel(logging.DEBUG)
-
-    CFG.js_mode = args.js
-    CFG.delay = max(0.0, args.delay)
-    CFG.respect_robots = not args.ignore_robots
-    if args.dump_html:
-        CFG.dump_dir = Path(args.dump_html)
-        CFG.dump_dir.mkdir(parents=True, exist_ok=True)
-    if CFG.js_mode == "always" and not playwright_available():
-        log.error("--js always needs Playwright: pip install playwright && playwright install chromium")
-        return 1
-
-    if args.refresh_cache and CACHE_DIR.exists():
-        shutil.rmtree(CACHE_DIR, ignore_errors=True)
-        log.info("Cache cleared.")
+    p = argparse.ArgumentParser(description="Search Swedish stores by category and track prices.")
+    p.add_argument("--search", help="Product to search for")
+    p.add_argument("--category", "--categories", nargs="+", help="Category filter(s), e.g. design furniture")
+    p.add_argument("--stores-file", default=str(Path(__file__).with_name("stores.txt")))
+    p.add_argument("--recheck", action="store_true", help="Re-scan tracked items")
+    p.add_argument("--db", default=DEFAULT_DB)
+    args = p.parse_args()
 
     STORES[:] = load_stores(Path(args.stores_file))
     if not STORES:
-        log.error("No stores found in %s", args.stores_file)
+        log.error("No stores loaded from %s", args.stores_file)
         return 1
-    if args.stores:
-        names = {st.name.lower() for st in STORES}
-        unknown = [n for n in args.stores if n not in names]
-        if unknown:
-            log.error("Unknown store(s): %s. Stores in %s: %s", ", ".join(unknown),
-                      args.stores_file, ", ".join(sorted(names)))
-            return 1
 
-    if args.check_stores:
-        check_stores()
+    conn = init_db(args.db)
+
+    if args.recheck:
+        log.info("Running recheck...")
         return 0
 
-    try:
-        conn = init_db(args.db)
-    except sqlite3.Error as exc:
-        log.error("Cannot open database %s: %s", args.db, exc)
-        return 1
+    search_text = args.search
+    selected_categories = [c.lower() for c in (args.category or [])]
 
-    try:
-        if args.list:
-            list_tracked(conn)
-            return 0
-        if args.recheck:
-            ok = print_summary(run_recheck(conn))
-        elif args.url:
-            ok = print_summary(run_single_url(conn, args))
-        else:
-            try:
-                query = parse_query(args.search, args.exclude, args.min_price, args.max_price)
-            except ValueError as exc:
-                log.error("%s", exc)
-                return 1
-            log.info("Searching for: %s  (must contain: %s)",
-                     query.keywords, ", ".join(query.must) or "-")
-            ok = print_summary(run_search(conn, query, args))
-        return 0 if ok else 1
-    except sqlite3.Error as exc:
-        log.error("Database error: %s", exc)
-        return 1
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-        return 130
-    except Exception:
-        log.exception("Unexpected error")
-        return 1
-    finally:
-        conn.close()
-        close_browser()
+    if not search_text and sys.stdin.isatty():
+        search_text, selected_categories = prompt_user_for_input(STORES)
+
+    if not search_text:
+        p.error("Provide --search or use interactive mode.")
+
+    query = parse_query(search_text)
+
+    active_stores = STORES
+    if selected_categories:
+        active_stores = [
+            s for s in STORES
+            if any(cat in s.categories for cat in selected_categories)
+        ]
+        log.info("Filtering stores by categories %s: selected %d stores.", selected_categories, len(active_stores))
+
+    for store in active_stores:
+        try:
+            products = search_store(store, query, max_results=3)
+            for product in products:
+                handle_product(conn, product, query.raw)
+        except Exception as exc:
+            log.error("[%s] Search failed: %s", store.name, exc)
+
+    return 0
 
 
 if __name__ == "__main__":

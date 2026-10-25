@@ -1,12 +1,55 @@
-# Stores to search - one per line:   Name - home URL
-# Lines starting with # are ignored.
-# If a shop's search page cannot be detected automatically, add its search URL
-# (with {q} where the search words go) as a third part, e.g.
-#   Power - https://www.power.se - https://www.power.se/search/?q={q}
+# Stores to search - format: Name - Home URL [ - Search Template URL] [# Category tag(s)]
 
-Elgiganten - https://www.elgiganten.se
-NetOnNet - https://www.netonnet.se
-Webhallen - https://www.webhallen.com/se
-Inet - https://www.inet.se
-Kjell - https://www.kjell.com/se
-# Komplett - https://www.komplett.se     (reset our connections in testing)
+# Categories: electronics, design, furniture, auction, clothing, general
+
+# You can assign multiple categories separated by commas, e.g. # design, furniture
+
+
+
+# --- Electronics ---
+
+Elgiganten - https://www.elgiganten.se # electronics
+
+NetOnNet - https://www.netonnet.se # electronics
+
+Webhallen - https://www.webhallen.com/se # electronics
+
+Inet - https://www.inet.se # electronics
+
+MediaMarkt - https://www.mediamarkt.se # electronics
+
+Kjell - https://www.kjell.com/se # electronics
+
+
+
+# --- Design & Furniture ---
+
+Svenssons - https://www.svenssons.se # design, furniture
+
+Nordiska Galleriet - https://www.nordiskagalleriet.se # design, furniture
+
+Länna Möbler - https://www.lannamobler.se # design, furniture
+
+Royal Design - https://royaldesign.se # design, furniture
+
+Rum21 - https://www.rum21.se # design, furniture
+
+Vålamagasinet - https://www.valamagasinet.se # design, furniture
+
+
+
+# --- Auction Sites & Second Hand ---
+
+Auctionet - https://auctionet.com/sv # auction
+
+Bukowskis - https://www.bukowskis.com/sv # auction
+
+Tradera - https://www.tradera.com # auction
+
+
+
+# --- General Retail & Department Stores ---
+
+Åhléns - https://www.ahlens.se # general, design, clothing
+
+CDON - https://cdon.se # general, electronics
