@@ -1,6 +1,6 @@
 # Stores to search - format: Name - Home URL [ - Search Template URL] [# Category tag(s)]
 
-# Categories: electronics, design, furniture, auction, clothing, general
+# Categories: electronics, design, furniture, auction, secondhand, clothing, general
 
 # You can assign multiple categories separated by commas, e.g. # design, furniture
 
@@ -45,6 +45,11 @@ Auctionet - https://auctionet.com/sv # auction
 Bukowskis - https://www.bukowskis.com/sv # auction
 
 Tradera - https://www.tradera.com # auction
+
+Blocket - https://www.blocket.se # secondhand
+
+# Facebook Marketplace search requires sign-in and is blocked by robots.txt; the CLI prints a manual search link.
+Facebook Marketplace - https://www.facebook.com # secondhand
 
 
 
