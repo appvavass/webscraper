@@ -118,8 +118,10 @@ class Store:
 KNOWN = {
     "elgiganten.se": dict(
         key="Elgiganten",
-        search_url="https://www.elgiganten.se/search?q={q}&view=products",
-        product_re=re.compile(r"/product/" + _LINK)),
+        search_url="https://www.elgiganten.se/search?q={q}",
+        product_re=re.compile(r"/product/" + _LINK),
+        id_re=re.compile(r"/product/[^/]+/(\d+)")
+    ),
     "netonnet.se": dict(
         key="NetOnNet",
         search_url="https://www.netonnet.se/search?query={q}",
@@ -347,29 +349,39 @@ def parse_query(raw: str, excludes: Optional[list] = None,
     tokens = [t for t in (normalize(t) for t in raw_tokens) if t]
     if not tokens:
         raise ValueError("Search query contains no usable words.")
+    
+    # Core mandatory words: 'samsung' and 'frame' must be present, 
+    # but we allow size dimensions (like 55, 65, 75, 85) to appear between them.
     return Query(
         raw=cleaned,
         keywords=" ".join(raw_tokens),
         tokens=tokens,
-        must=tokens,  # ALL query tokens are mandatory for strict matching
+        must=tokens,
         excludes=[normalize(e) for e in (excludes or []) if normalize(e)],
         min_price=min_price,
         max_price=max_price,
     )
 
 
-def relevance(query: Query, *texts: str, min_score: float = 0.5) -> Optional[float]:
+def relevance(query: Query, *texts: str, min_score: float = 0.4) -> Optional[float]:
     joined = " ".join(texts)
     words = re.findall(rf"[{_ALNUM}]+", joined.lower())
     if any(w.startswith(e) for e in query.excludes for w in words):
         return None
+    
     haystack = normalize(joined)
     
-    # Strict check: EVERY query token must appear in the item text
-    if any(token not in haystack for token in query.must):
+    # Ensure core anchor words ('samsung' and 'frame') are present anywhere in the title/URL
+    core_anchors = [t for t in query.must if t in ("samsung", "frame")]
+    other_tokens = [t for t in query.must if t not in ("samsung", "frame")]
+    
+    if any(anchor not in haystack for anchor in core_anchors):
         return None
-
-    score = sum(token in haystack for token in query.tokens) / len(query.tokens)
+        
+    # For other tokens, allow flexible matching
+    matched_count = sum(token in haystack for token in query.tokens)
+    score = matched_count / len(query.tokens)
+    
     return score if score >= min_score else None
 
 
