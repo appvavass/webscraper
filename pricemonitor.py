@@ -46,6 +46,7 @@ import json
 import logging
 import random
 import re
+import shlex
 import shutil
 import sqlite3
 import sys
@@ -314,7 +315,7 @@ class Product:
 
 
 # --------------------------------------------------------------------------- #
-# Query Engine & Relevance Evaluation
+# Query Engine & Relevance Evaluation (Strict All-Token Match)
 # --------------------------------------------------------------------------- #
 
 _ALNUM = "0-9a-zåäöé"
@@ -350,7 +351,7 @@ def parse_query(raw: str, excludes: Optional[list] = None,
         raw=cleaned,
         keywords=" ".join(raw_tokens),
         tokens=tokens,
-        must=[t for t in tokens if any(c.isdigit() for c in t)],
+        must=tokens,  # ALL query tokens are mandatory for strict matching
         excludes=[normalize(e) for e in (excludes or []) if normalize(e)],
         min_price=min_price,
         max_price=max_price,
@@ -363,8 +364,11 @@ def relevance(query: Query, *texts: str, min_score: float = 0.5) -> Optional[flo
     if any(w.startswith(e) for e in query.excludes for w in words):
         return None
     haystack = normalize(joined)
+    
+    # Strict check: EVERY query token must appear in the item text
     if any(token not in haystack for token in query.must):
         return None
+
     score = sum(token in haystack for token in query.tokens) / len(query.tokens)
     return score if score >= min_score else None
 
@@ -998,7 +1002,7 @@ def check_stores() -> None:
 
 def print_flag_reminder():
     print("\n" + "=" * 65)
-    print("💡 HELPER FLAGS REMINDER (Pass these via command-line):")
+    print("💡 HELPER FLAGS REMINDER (Pass these via command-line or interactive prompt):")
     print("  --category CAT [CAT...] : Filter shops (electronics, design, furniture, auction, general)")
     print("  --exclude WORD [WORD...] : Exclude items with specific words (e.g. --exclude skal fodral)")
     print("  --min-price SEK          : Ignore items cheaper than SEK limit")
@@ -1011,9 +1015,6 @@ def print_flag_reminder():
     print("  --dump-html DIR          : Dump raw HTML for debugging")
     print("  -v, --verbose            : Turn on verbose log messages")
     print("=" * 65 + "\n")
-
-
-import shlex
 
 
 def prompt_user_for_input(all_stores: list[Store], base_args: argparse.Namespace) -> tuple[str, list[str]]:
@@ -1033,7 +1034,6 @@ def prompt_user_for_input(all_stores: list[Store], base_args: argparse.Namespace
 
     extra_args, remaining_tokens = sub_parser.parse_known_args(tokens)
 
-    # Update base args with any flags parsed from the prompt string
     if extra_args.min_price is not None:
         base_args.min_price = extra_args.min_price
     if extra_args.max_price is not None:
@@ -1043,10 +1043,8 @@ def prompt_user_for_input(all_stores: list[Store], base_args: argparse.Namespace
     if extra_args.max_per_store is not None:
         base_args.max_per_store = extra_args.max_per_store
 
-    # Clean search query text without the flags
     search_text = " ".join(remaining_tokens)
 
-    # Category selection prompt
     categories_set = set()
     for store in all_stores:
         categories_set.update(store.categories)
@@ -1068,6 +1066,7 @@ def prompt_user_for_input(all_stores: list[Store], base_args: argparse.Namespace
                 selected_cats.append(sorted_categories[idx - 1])
 
     return search_text, selected_cats
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -1152,7 +1151,7 @@ def main() -> int:
 
     if not search_text and sys.stdin.isatty():
         search_text, selected_categories = prompt_user_for_input(STORES, args)
-        
+
     if not search_text:
         log.error("Please provide a search query or use interactive mode.")
         return 1
