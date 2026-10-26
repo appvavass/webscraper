@@ -97,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--check-stores", action="store_true", help="Check robots.txt status")
     mode.add_argument("--url", nargs="+", help="Track specific product page URLs")
     mode.add_argument("--web", action="store_true", help="Start the local database dashboard")
+    mode.add_argument("--scan", action="store_true", help="Run a full scan of tracked products and saved searches")
     mode.add_argument("--send-daily-report", action="store_true", help="Send the last 24 hours of prices to Telegram")
     mode.add_argument("--daily", action="store_true", help="Recheck tracked prices, then send a Telegram report")
 
@@ -141,7 +142,9 @@ def main() -> int:
     if args.web:
         from .web import create_app
 
-        create_app(args.db).run(host=args.host, port=args.port, debug=False)
+        create_app(args.db, stores_path=args.stores_file).run(
+            host=args.host, port=args.port, debug=False
+        )
         return 0
 
     if args.send_daily_report or args.daily:
@@ -161,6 +164,12 @@ def main() -> int:
             log.error("Daily report failed: %s", exc)
             return 1
         log.info("Daily report sent to Telegram (%d characters).", character_count)
+        return 0
+
+    if getattr(args, "scan", False):
+        from .scanner import run_hourly_scan
+
+        run_hourly_scan(args.db, args.stores_file)
         return 0
 
     STORES[:] = load_stores(Path(args.stores_file))

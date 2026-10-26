@@ -38,8 +38,66 @@ def init_db(db_path: str) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id TEXT NOT NULL,
+            product_name TEXT,
+            store TEXT,
+            url TEXT NOT NULL,
+            previous_price REAL NOT NULL,
+            new_price REAL NOT NULL,
+            changed_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scan_status (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            status TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            summary TEXT,
+            error TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO scan_status (id, status)
+        VALUES (1, 'idle')
+        """
+    )
     conn.commit()
     return conn
+
+
+def get_price_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT id, product_id, product_name, store, url,
+               previous_price, new_price, changed_at
+          FROM price_notifications
+         ORDER BY id DESC
+         LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "id": row[0],
+            "product_id": row[1],
+            "product_name": row[2],
+            "store": row[3],
+            "url": row[4],
+            "previous_price": row[5],
+            "new_price": row[6],
+            "changed_at": row[7],
+        }
+        for row in rows
+    ]
 
 
 def get_daily_summary(conn: sqlite3.Connection, now: Optional[datetime] = None) -> list[dict]:
@@ -127,10 +185,35 @@ def get_previous_and_lowest(conn: sqlite3.Connection, product: Product):
 
 def save_price(conn: sqlite3.Connection, product: Product, query_text: Optional[str]) -> None:
     now = datetime.now().isoformat(timespec="seconds")
+    previous = conn.execute(
+        """
+        SELECT price FROM price_history
+         WHERE product_id = ? OR url = ?
+         ORDER BY id DESC LIMIT 1
+        """,
+        (product.product_id, product.url),
+    ).fetchone()
     conn.execute(
         "INSERT INTO price_history (url, product_name, price, scanned_at, product_id, store) VALUES (?, ?, ?, ?, ?, ?)",
         (product.url, product.name, product.price, now, product.product_id, product.store),
     )
+    if previous is not None and previous[0] != product.price:
+        conn.execute(
+            """
+            INSERT INTO price_notifications
+                (product_id, product_name, store, url, previous_price, new_price, changed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                product.product_id,
+                product.name,
+                product.store,
+                product.url,
+                previous[0],
+                product.price,
+                now,
+            ),
+        )
     conn.execute(
         """
         INSERT INTO tracked_products (product_id, url, store, name, search_query, first_seen, last_seen)

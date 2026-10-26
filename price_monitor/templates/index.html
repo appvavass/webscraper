@@ -16,7 +16,7 @@
       <div>
         <p class="eyebrow">PRICE TRACKING DASHBOARD</p>
         <h1>Your products</h1>
-        <p class="muted">Browse tracked products and review their price history.</p>
+        <p class="muted">Search stores online, track products, and review their price history.</p>
       </div>
       <div class="period-pill"><span class="status-dot"></span> Last 24 hours</div>
     </section>
@@ -25,6 +25,100 @@
       <article class="stat-card"><span>Tracked products</span><strong>{{ products|length }}</strong></article>
       <article class="stat-card"><span>Price checks</span><strong>{{ recent_observations }}</strong></article>
       <article class="stat-card"><span>Products checked</span><strong>{{ recent_products }}</strong></article>
+    </section>
+
+    <section class="panel scan-panel">
+      <div>
+        <h2>Automatic scans</h2>
+        {% if scan_status["status"] == "running" %}
+        <p class="muted">A scan is running. It checks tracked links, then searches all stores using your saved search terms.</p>
+        {% elif scan_status["summary"] %}
+        <p class="muted">{{ scan_status["summary"] }}</p>
+        {% elif scan_status["error"] %}
+        <p class="notice notice-error">{{ scan_status["error"] }}</p>
+        {% else %}
+        <p class="muted">A full scan runs automatically every hour.</p>
+        {% endif %}
+        {% if next_scan %}<p class="scan-time muted">Next automatic scan: {{ next_scan.strftime("%Y-%m-%d %H:%M") }}</p>{% endif %}
+      </div>
+      <form method="post" action="{{ url_for('trigger_scan') }}">
+        <button type="submit" {% if scan_status["status"] == "running" %}disabled{% endif %}>Scan now</button>
+      </form>
+    </section>
+
+    {% for category, message in get_flashed_messages(with_categories=true) %}
+    <p class="notice notice-{{ category }}" role="status">{{ message }}</p>
+    {% endfor %}
+
+    <section class="notifications-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">PRICE ALERTS</p>
+          <h2>Notifications</h2>
+        </div>
+        <span class="muted">{{ notifications|length }} recent changes</span>
+      </div>
+      {% if notifications %}
+      <div class="notification-list">
+        {% for notification in notifications %}
+        <article class="notification">
+          <div>
+            <a class="product-link" href="{{ url_for('product_detail', product_id=notification['product_id']) }}">
+              {{ notification["product_name"] or "Tracked product" }}
+            </a>
+            <p class="muted">{{ notification["store"] or "Unknown store" }} · {{ notification["changed_at"]|replace("T", " ") }}</p>
+          </div>
+          <div class="notification-prices">
+            <span class="muted">{{ "%.2f"|format(notification["previous_price"]) }} kr</span>
+            <span aria-hidden="true">→</span>
+            <strong class="{% if notification['new_price'] < notification['previous_price'] %}price-down{% else %}price-up{% endif %}">
+              {{ "%.2f"|format(notification["new_price"]) }} kr
+            </strong>
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="empty-notifications muted">No price changes have been detected yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel search-panel">
+      <form class="web-search-form" method="post" action="{{ url_for('search_products') }}">
+        <div class="search-heading">
+          <strong>Search stores</strong>
+          <span class="muted">Search by keyword and start tracking matching products.</span>
+        </div>
+        <label class="sr-only" for="product-search">Product keywords</label>
+        <input id="product-search" type="search" name="q" maxlength="200" required
+               value="{{ query if request.args.get('searched') else '' }}"
+               placeholder="What are you looking for?">
+        <fieldset class="category-options">
+          <legend>Categories <span class="muted">— leave all unchecked to search every category</span></legend>
+          <div class="category-list">
+            {% for category in categories %}
+            <label class="category-option">
+              <input type="checkbox" name="category" value="{{ category }}"
+                     {% if category in selected_categories %}checked{% endif %}>
+              <span>{{ category|capitalize }}</span>
+            </label>
+            {% endfor %}
+          </div>
+        </fieldset>
+        <button type="submit">Search and track</button>
+      </form>
+    </section>
+
+    <section class="panel track-panel">
+      <form class="track-form" method="post" action="{{ url_for('track_product') }}">
+        <label for="track-url">
+          <strong>Track a product</strong>
+          <span class="muted">Paste a product page URL from a supported store.</span>
+        </label>
+        <input id="track-url" type="url" name="url" maxlength="2048" required
+               placeholder="https://www.example.com/product/..." autocomplete="url">
+        <button type="submit">Start tracking</button>
+      </form>
     </section>
 
     <section class="panel">
@@ -69,11 +163,11 @@
       <div class="empty-state">
         <span class="empty-icon">↗</span>
         <h2>{% if query or selected_store %}No matching products{% else %}No tracked products yet{% endif %}</h2>
-        <p class="muted">{% if query or selected_store %}Try changing or clearing your filters.{% else %}Run a search with <code>pricemonitor.py --search "product name"</code> to start collecting prices.{% endif %}</p>
+        <p class="muted">{% if query or selected_store %}Try changing or clearing your filters.{% else %}Search for a product above or paste a product link to start tracking.{% endif %}</p>
       </div>
       {% endif %}
     </section>
-    <footer>Price data is stored locally in your SQLite database.</footer>
+    <footer>Price data is stored in the configured SQLite database.</footer>
   </main>
 </body>
 </html>
